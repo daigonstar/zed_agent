@@ -4092,6 +4092,7 @@ class OllamaZedAgent(Agent):
         test_runs: list[str] = []
         call_counts: dict[str, int] = {}
         failure_streak = 0
+        empty_nudged = False
         allowed_tools = {tool["function"]["name"] for tool in TOOLS}
 
         try:
@@ -4171,10 +4172,24 @@ class OllamaZedAgent(Agent):
                 )
 
                 if not tool_calls:
-                    final_text = content or (
-                        "The model returned an empty response. "
-                        "Try rephrasing the request."
-                    )
+                    if not content and step > 0 and not empty_nudged:
+                        # Some models go silent after a tool result; ask once
+                        # for a summary before giving up.
+                        empty_nudged = True
+                        messages.append({
+                            "role": "user",
+                            "content": "Summarize what you did and the result in a sentence or two.",
+                        })
+                        continue
+                    if content:
+                        final_text = content
+                    elif actions:
+                        final_text = "Done. " + "; ".join(actions[-10:])
+                    else:
+                        final_text = (
+                            "The model returned an empty response. "
+                            "Try rephrasing the request."
+                        )
                     streamed_final_response = bool(streamed_parts and content)
                     break
 
