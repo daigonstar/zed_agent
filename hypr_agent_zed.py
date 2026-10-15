@@ -110,7 +110,8 @@ NUM_CTX = int(os.environ.get("OLLAMA_AGENT_NUM_CTX", "32768"))
 MAX_TOOL_STEPS = int(os.environ.get("OLLAMA_AGENT_MAX_TOOL_STEPS", "40"))
 
 # ---- To switch model, change DEFAULT_MODEL here (or set OLLAMA_AGENT_MODEL) ----
-DEFAULT_MODEL = "devstral-small-2:latest"
+# Common models for AMD GPU users: qwen2.5:7b, llama3.1:8b, mistral:latest, etc.
+DEFAULT_MODEL = "qwen2.5:7b"
 MODEL = os.environ.get("OLLAMA_AGENT_MODEL", "").strip() or DEFAULT_MODEL
 
 

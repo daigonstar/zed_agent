@@ -1,7 +1,7 @@
 # Zed Ollama agent
 
 An [ACP](https://agentclientprotocol.com) agent that lets Zed drive a local Ollama model
-(default `qwen3:14b`) with sandboxed, approval-gated tools.
+(default `qwen3.5:9b-q8_0`) with sandboxed, approval-gated tools.
 
 ## Install (also after a reinstall)
 
