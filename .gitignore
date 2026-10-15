@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.claude
+tests
+zed_agent.md
