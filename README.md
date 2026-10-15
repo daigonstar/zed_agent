@@ -30,3 +30,8 @@ the "Hypr Agent" `env` block in Zed's settings.
 ## Vision / screenshots
 
 The agent advertises image support to Zed, so you can paste or attach screenshots to a message. Images are sent to Ollama for that turn only (not kept in history). This needs a vision-capable model, e.g. `OLLAMA_AGENT_MODEL=qwen2.5vl:7b` (also gemma3, llama3.2-vision). If the model reports no vision capability the agent says so instead of sending the image. Limits: 4 images per message, 10 MB each.
+
+## Running-app checks (Laravel / Vite)
+
+- `dev_server` starts `npm run dev`, `npx vite` or `php artisan serve` in the sandbox (localhost only, approval required) and keeps it running; `logs`, `status` and `stop` manage it. Servers are stopped when the agent exits.
+- `check_app` opens a `http://localhost:PORT/...` page: HTTP status and Laravel/Vite error pages, plus a screenshot passed to a vision model. It uses Chromium first (console errors, rendered DOM, screenshot), then Zen (`zen-browser`) or Firefox (screenshot only). Set `OLLAMA_AGENT_BROWSER` to override. Without a browser only the HTTP check runs. Ports not started by the agent need approval.

@@ -50,6 +50,68 @@ class SyntaxCheckTests(unittest.TestCase):
         self.assertIn("SYNTAX ERROR", h.write_file("b.json", "{", cwd=str(ws)))
 
 
+class LaravelTests(unittest.TestCase):
+    def setUp(self):
+        self.ws = _workspace()
+        (self.ws / "artisan").write_text("<?php\n")
+        (self.ws / "composer.json").write_text('{"scripts": {"test": "php artisan test"}}')
+
+    def test_detects_artisan_first(self):
+        self.assertEqual(h.detect_test_commands(self.ws)[:2], ["php artisan test", "composer test"])
+
+    def test_artisan_is_read_only(self):
+        for ok in ("php artisan test --filter=Foo", "php artisan route:list", "php vendor/bin/pint --test"):
+            self.assertIsNone(h.validate_test_command(ok, self.ws, self.ws)[1], ok)
+        for bad in ("php artisan migrate", "php artisan tinker", "php vendor/bin/pint", "php -r 'x'"):
+            self.assertIsNotNone(h.validate_test_command(bad, self.ws, self.ws)[1], bad)
+
+    def test_parses_phpunit_failures(self):
+        out = "  FAILED  Tests\\Feature\\FooTest > it works\n1) Tests\\Unit\\BarTest::test_x\nTests:    2 failed, 3 passed"
+        _, failing = h.summarise_test_output(out)
+        self.assertEqual(len(failing), 2)
+
+
+class DevServerTests(unittest.TestCase):
+    def test_only_local_dev_servers_allowed(self):
+        ok = h.validate_dev_command("php artisan serve --port 8000")
+        self.assertIn("--host=127.0.0.1", ok[0])
+        self.assertIsNone(h.validate_dev_command("npm run dev -- --port 5173")[1])
+        self.assertIsNone(h.validate_dev_command("npx vite")[1])
+        for bad in ("npm run build", "php artisan serve --host 0.0.0.0", "python3 -m http.server", "npx http-server"):
+            self.assertIsNotNone(h.validate_dev_command(bad)[1], bad)
+
+    def test_check_app_is_localhost_only(self):
+        self.assertIn("Rejected", h.check_app("http://example.com/"))
+        self.assertIn("Rejected", h.check_app("http://user:pw@localhost/"))
+        self.assertTrue(h.tool_needs_gate("check_app", {"url": "http://127.0.0.1:9/"}))
+        self.assertTrue(h.tool_needs_gate("dev_server", {"action": "start"}))
+        self.assertFalse(h.tool_needs_gate("dev_server", {"action": "logs"}))
+
+    def test_check_app_reports_http_errors(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<title>QueryException</title><body>Whoops! SQLSTATE[HY000]</body>")
+            def log_message(self, *a): pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            out = h.check_app(f"http://127.0.0.1:{server.server_port}/")
+        finally:
+            server.shutdown()
+        self.assertIn("PROBLEMS FOUND", out)
+        self.assertIn("500", out)
+
+    def test_screenshots_replace_old_images(self):
+        messages = []
+        h.attach_screenshots(messages, ["a"], "one")
+        h.attach_screenshots(messages, ["b"], "two")
+        self.assertEqual(messages[0]["images"], [])
+        self.assertEqual(messages[1]["images"], ["b"])
+
+
 class EditFileTests(unittest.TestCase):
     def setUp(self):
         self.ws = _workspace()

@@ -41,6 +41,7 @@ tool result confirms success. No shell is used to execute commands.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import json
 import logging
@@ -304,6 +305,18 @@ Tool-call rules:
 - Commands are killed after a timeout, so never start servers or watchers such as artisan serve or npm run dev.
 - If the workspace already holds files, scaffold new projects into a subfolder rather than the workspace root.
 
+Laravel workflow (when the project has an artisan file):
+- Autonomous loop: (1) if vendor/ is missing or the result reports a missing dependency or autoload error, call setup_test_env (kind php; it runs composer install without scripts and creates .env with an app key); (2) run_tests with no command to get a baseline; (3) for each failure read the test, the code under test, and the error; (4) if the error is unclear, read storage/logs/laravel.log with read_file (tail it with line_start) and inspect the app with run_tests commands such as `php artisan route:list`, `php artisan migrate:status`, `php artisan config:show database` or `php artisan about`; (5) state the root cause, fix it with the smallest edit_file; (6) re-run the failing test (`php artisan test --filter=TestName`), then the full suite; (7) when green, run `php vendor/bin/pint --test` and phpstan if the project has them and fix what they report. Stop when the suite passes or you are blocked.
+- Common causes: missing APP_KEY or .env values, migrations not matching the model or factory, missing factory/seeder, wrong route name or middleware, mass-assignment ($fillable) errors, N+1 or relationship names, config cached from an old value, type errors after a PHP upgrade.
+- Fix the application code, not the test, unless the test itself is wrong; say why when you change a test. Add a migration or factory when schema or test data is missing rather than editing the database.
+- Do not run migrate, db:seed, config:cache, key:generate or serve yourself; run_tests is read-only and sandboxed. If a real database change or a live artisan command is needed, ask the user to run it and explain why.
+- Report at the end: what failed, the root cause, each change made, and the final test result.
+
+Running-app verification (Laravel/Vite and other web projects):
+- After the tests pass, verify the real app. (1) dev_server start the backend (`php artisan serve --port 8000`) and, if package.json has a dev script, the frontend (`npm run dev`); use the URL each one returns. If node_modules is missing, call setup_test_env kind node first. (2) check_app each important page (home, login, and routes found with `php artisan route:list`). It reports HTTP status, error pages, browser console errors and attaches a screenshot you can see: describe what is on it and say if the layout looks broken (unstyled, blank, missing assets). (3) On a problem, read dev_server logs and storage/logs/laravel.log, find the cause, fix it with edit_file, and check the page again. Common causes: Vite not running or manifest missing (`public/build` absent and no `public/hot`), APP_KEY missing, database not migrated (ask the user to run `php artisan migrate`), wrong APP_URL, a missing view or route, JavaScript import errors.
+- Stop the servers with dev_server stop when you are done unless the user wants them left running. Never claim a page works unless check_app reported no problems for it.
+- If check_app says no browser was found, say that only the HTTP check was done. With Zen or Firefox only a screenshot is taken (no console errors), so also read the dev_server logs for Vite and JavaScript errors.
+
 Testing and verification rules:
 - Every write_file and edit_file result ends with a syntax check of the changed file. If it reports SYNTAX ERROR, fix it immediately with edit_file before doing anything else. For file types that are not checked automatically, say so rather than claiming the syntax is valid. Never tell the user a change is done while its syntax check is failing.
 - Use run_tests, not run_command, to run tests, linters, type checkers and builds. It runs in a sandbox with a throwaway view of the workspace and no network, and Zed asks for approval once per session. Leave the command out to run the detected project test command.
@@ -415,13 +428,14 @@ TOOLS = [
     schema(
         "setup_test_env",
         "Prepare a folder so run_tests can work offline: create a Python .venv and install "
-        "requirements (or the named packages) or run npm install without scripts. This is the "
+        "requirements (or the named packages), run npm install without scripts, or run composer install "
+        "without scripts for PHP/Laravel (creating .env with an app key if missing). This is the "
         "only step that uses the network; it runs in the sandbox, can write only inside the "
         "workspace, and Zed asks for approval each time. Use it when run_tests reports a "
         "missing dependency.",
         {
             "directory": STR("Project folder inside the workspace. Defaults to the workspace."),
-            "kind": {"type": "string", "enum": ["auto", "python", "node"]},
+            "kind": {"type": "string", "enum": ["auto", "python", "node", "php"]},
             "packages": STR("Optional space-separated Python packages, e.g. 'pytest requests>=2'."),
         },
     ),
@@ -489,6 +503,28 @@ TOOLS = [
         "Search the web for current information and return titles, URLs, and snippets.",
         {"query": STR("Search query.")},
         ["query"],
+    ),
+    schema(
+        "dev_server",
+        "Start, stop or inspect a local dev server that keeps running between tool calls: "
+        "npm/pnpm/yarn run dev|start|serve|preview, npx vite, or php artisan serve. It runs "
+        "in the sandbox bound to localhost. action=start waits for the URL and returns it "
+        "(Zed asks for approval); logs shows recent output; status lists servers; stop ends one.",
+        {
+            "action": {"type": "string", "enum": ["start", "stop", "logs", "status"]},
+            "name": STR("Short label such as 'vite' or 'laravel'."),
+            "command": STR("For start: e.g. 'npm run dev' or 'php artisan serve --port 8000'."),
+        },
+        ["action"],
+    ),
+    schema(
+        "check_app",
+        "Open a page of the running app (http://localhost:PORT/path only) and verify it: HTTP "
+        "status, error pages (Laravel Whoops, Vite manifest errors), and, when a Chromium "
+        "browser is installed (Zen/Firefox: screenshot; Chromium: also console errors and the "
+        "rendered DOM), a screenshot you can see. Call it for each important route.",
+        {"url": STR("Full localhost URL, e.g. http://127.0.0.1:8000/login.")},
+        ["url"],
     ),
     schema(
         "web_fetch",
@@ -1879,14 +1915,20 @@ TEST_SCRIPT_NAME = re.compile(
 )
 TEST_MAKE_TARGETS = {"test", "tests", "check", "lint", "ci", "build", "verify", "typecheck", "all"}
 TEST_COMPOSER_SCRIPTS = {"test", "tests", "lint", "analyse", "analyze", "check", "stan", "phpstan", "cs", "ci"}
+# Artisan commands that only inspect the application. They run in the throwaway test view.
+LARAVEL_ARTISAN_READONLY = {
+    "test", "about", "list", "route:list", "config:show", "migrate:status", "model:show",
+    "event:list", "schedule:list", "db:show", "env", "--version",
+}
 TEST_FORBIDDEN_FLAGS = {"--fix", "--fix-only", "--unsafe-fixes", "--write"}
 TEST_FORBIDDEN_MAKE_FLAGS = {"-f", "--file", "--makefile", "-C", "--directory", "-e", "--eval"}
 TEST_ALLOWED_SUMMARY = (
     "pytest, python -m pytest/unittest/mypy/ruff, ruff, mypy, flake8, pylint, "
     "black/isort with --check, npm/pnpm/yarn test or run test|lint|typecheck|build, "
     "npx jest/vitest/eslint/tsc, node --test, cargo test|check|clippy|build, "
-    "go test|vet|build, make test|check|lint|build, composer test, php artisan test, "
-    "phpunit/pest"
+    "go test|vet|build, make test|check|lint|build, composer test, php artisan test and "
+    "read-only artisan commands (route:list, about, config:show, migrate:status ...), "
+    "phpunit/pest, phpstan, pint --test"
 )
 
 
@@ -2059,11 +2101,23 @@ def validate_test_command(
     if base == "php":
         if "-r" in args:
             return None, "php -r is not allowed."
-        if positionals[:2] == ["artisan", "test"]:
+        if positionals[:1] == ["artisan"]:
+            sub = positionals[1] if len(positionals) > 1 else ""
+            if sub in LARAVEL_ARTISAN_READONLY:
+                return argv, None
+            return None, (
+                "php artisan may only run: " + ", ".join(sorted(LARAVEL_ARTISAN_READONLY))
+                + ". Changes are made with edit_file and write_file."
+            )
+        if positionals and Path(positionals[0]).name == "pint":
+            if "--test" in args:
+                return argv, None
+            return None, "pint may only run with --test (it reports style problems without changing files)."
+        if positionals and Path(positionals[0]).name in {"phpunit", "pest", "phpstan", "larastan"}:
             return argv, None
-        if positionals and Path(positionals[0]).name in {"phpunit", "pest", "phpstan"}:
+        if "-l" in args and positionals:
             return argv, None
-        return None, "php may only run artisan test, or phpunit, pest or phpstan."
+        return None, "php may only run artisan (read-only commands), phpunit, pest, phpstan, pint --test, or php -l FILE."
 
     return None, unsupported
 
@@ -2121,10 +2175,12 @@ def detect_test_commands(workspace: Path) -> list[str]:
         commands.append("go test ./...")
 
     composer = _read_small(workspace / "composer.json")
-    if composer and '"test"' in composer:
-        commands.append("composer test")
-    elif (workspace / "artisan").is_file():
+    if (workspace / "artisan").is_file():
         commands.append("php artisan test")
+        if composer and '"test"' in composer:
+            commands.append("composer test")
+    elif composer and '"test"' in composer:
+        commands.append("composer test")
     elif (workspace / "vendor/bin/phpunit").is_file():
         commands.append("php vendor/bin/phpunit")
 
@@ -2138,6 +2194,8 @@ _FAIL_LINE = re.compile(
     r"^(FAILED|ERROR)\s+(?!\()\S+"
     r"|^(FAIL|FAILED|ERROR):\s+\S+"
     r"|^\s*FAIL\s+\S+"
+    r"|^\s*FAILED\s+\S+"
+    r"|^\d+\) \S+::\S+"
     r"|^--- FAIL: "
     r"|^test .* \.\.\. FAILED$"
     r"|^\s*(✕|×)\s"
@@ -2152,6 +2210,8 @@ _SUMMARY_LINE = re.compile(
     r"|^test result: "
     r"|^(ok|FAIL)\s+\S+"
     r"|^(OK \(\d+ tests?|Tests: \d+|FAILURES!|ERRORS!)"
+    r"|^(Illuminate\\|Symfony\\|PDOException|Error|ParseError|TypeError)\S*"
+    r"|^\s*(Base table or view not found|SQLSTATE\[)"
     r"|^(Found \d+ errors?|Success: no issues found|All checks passed!)"
     r"|^✖ \d+ problems?"
     r"|error TS\d+:"
@@ -2183,6 +2243,7 @@ def summarise_test_output(text: str) -> tuple[list[str], list[str]]:
 
 _MISSING_DEPENDENCY = re.compile(
     r"No module named|ModuleNotFoundError|Cannot find module|command not found"
+    r"|vendor/autoload\.php|Failed opening required .*vendor|Class \"[\w\\]+\" not found"
     r"|could not find `Cargo.toml`|no required module provides package",
 )
 
@@ -2331,16 +2392,33 @@ def setup_test_env(
 
     kind = (kind or "auto").strip().lower()
     if kind == "auto":
-        if (run_dir / "package.json").is_file() and not any(
+        has_python = any(
             (run_dir / name).is_file()
             for name in ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg")
-        ):
+        )
+        if (run_dir / "composer.json").is_file() and not has_python:
+            kind = "php"
+        elif (run_dir / "package.json").is_file() and not has_python:
             kind = "node"
         else:
             kind = "python"
 
     steps: list[list[str]] = []
-    if kind == "node":
+    if kind == "php":
+        if not (run_dir / "composer.json").is_file():
+            return "Rejected: no composer.json in that directory."
+        if packages and packages.strip():
+            return "Rejected: packages are only supported for python; edit composer.json instead."
+        # Composer scripts (post-install hooks) are skipped: they run arbitrary project code.
+        steps.append(["composer", "install", "--no-interaction", "--no-scripts", "--no-progress", "--prefer-dist"])
+        example = run_dir / ".env.example"
+        if example.is_file() and not (run_dir / ".env").exists() and (run_dir / "artisan").is_file():
+            try:
+                shutil.copyfile(example, run_dir / ".env")
+            except OSError as exc:
+                return f"Could not create .env from .env.example: {exc}"
+            steps.append(["php", "artisan", "key:generate", "--force", "--no-interaction"])
+    elif kind == "node":
         if not (run_dir / "package.json").is_file():
             return "Rejected: no package.json in that directory."
         if packages and packages.strip():
@@ -2395,7 +2473,13 @@ def setup_test_env(
                 f"FAILED: {shlex.join(argv)} ({result.status}, exit {result.returncode})", tail,
             ])
         report.append(f"ok: {shlex.join(argv)}")
-    if kind == "python":
+    if kind == "php":
+        report.append(
+            "Done. vendor/ is installed (and .env created with an app key when it was missing). "
+            "Run run_tests; Laravel tests normally use an in-memory SQLite database. Composer "
+            "scripts were skipped."
+        )
+    elif kind == "python":
         report.append(
             "Done. run_tests will use .venv/bin/python in this directory. Tests have no "
             "network, so any other dependency must be installed with setup_test_env first."
@@ -3081,6 +3165,523 @@ def edit_file(path: str, old: str, new: str, cwd: str | None = None) -> str:
     return f"Edited {resolved}.{note} {syntax_check(resolved)}"
 
 
+
+# ---------------------------------------------------------------------------
+# Dev servers and running-app checks
+# ---------------------------------------------------------------------------
+# dev_server starts Vite / artisan serve / npm run dev in the sandbox (workspace
+# writable, localhost reachable) and keeps them running between tool calls.
+# check_app then loads a localhost page with plain HTTP and, when a Chromium
+# based browser is installed, in a headless browser that reports console errors
+# and takes a screenshot for vision models.
+
+MAX_DEV_SERVERS = 3
+DEV_START_WAIT = int(os.environ.get("OLLAMA_AGENT_DEV_START_WAIT", "40"))
+_DEV_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,19}")
+_DEV_URL = re.compile(r"https?://(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(\d{2,5})[^\s\]\"'<>]*")
+_DEV_EXTRA_ARG = re.compile(
+    r"--|--port|--port=\d{2,5}|--host|--host=(?:127\.0\.0\.1|localhost)|127\.0\.0\.1|localhost|\d{2,5}"
+)
+_DEV_SCRIPTS = {"dev", "start", "serve", "preview"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Chromium based browsers are preferred (console and DOM checks); Zen/Firefox give screenshots only.
+FIREFOX_NAMES = ("zen-browser", "zen", "firefox")
+BROWSER_NAMES = ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "chrome")
+APP_ERROR_MARKERS = (
+    "Whoops", "ErrorException", "QueryException", "Vite manifest not found",
+    "Server Error", "Class \"", "Undefined variable", "SQLSTATE[", "Internal Server Error",
+    "Unable to locate file in Vite manifest", "vite-error-overlay",
+)
+
+_DEV_SERVERS: dict[str, dict[str, Any]] = {}
+_TOOL_IMAGES: list[str] = []
+_TOOL_IMAGES_LOCK = threading.Lock()
+
+
+def drain_tool_images() -> list[str]:
+    """Screenshots produced by tools since the last call (base64)."""
+    with _TOOL_IMAGES_LOCK:
+        images = list(_TOOL_IMAGES)
+        _TOOL_IMAGES.clear()
+    return images
+
+
+def attach_screenshots(messages: list[dict[str, Any]], shots: list[str], label: str) -> None:
+    """Add screenshots as a user message, dropping images from older screenshot messages."""
+    marker = "[Screenshot from check_app"
+    for message in messages:
+        if message.get("images") and str(message.get("content", "")).startswith(marker):
+            message["images"] = []
+            message["content"] += " (image removed to save context)"
+    messages.append({
+        "role": "user",
+        "content": f"{marker}: {label}] Look at it and judge whether the page renders correctly.",
+        "images": shots[:2],
+    })
+
+
+def validate_dev_command(command: str) -> tuple[list[str] | None, str | None]:
+    """Only a short list of local dev servers may be started, bound to localhost."""
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        return None, f"Could not parse the command: {exc}"
+    if not argv:
+        return None, "The command is empty."
+    base = Path(argv[0]).name
+    positionals = [a for a in argv[1:] if not a.startswith("-")]
+    extras: list[str] = []
+    if base in {"npm", "pnpm", "yarn"}:
+        script = positionals[1] if positionals[:1] == ["run"] and len(positionals) > 1 else (positionals[0] if positionals else "")
+        rest = argv[1:]
+        if script not in _DEV_SCRIPTS:
+            return None, f"{base} may only run the scripts: {', '.join(sorted(_DEV_SCRIPTS))}."
+        skip = rest.index(script)
+        extras = rest[skip + 1:]
+    elif base == "npx":
+        if not positionals or positionals[0] != "vite":
+            return None, "npx may only run vite."
+        extras = [a for a in argv[2:] if a != "preview"]
+    elif base == "php":
+        if positionals[:2] != ["artisan", "serve"]:
+            return None, "php may only run `php artisan serve`."
+        extras = argv[3:]
+    else:
+        return None, (
+            "Only these dev servers can be started: npm/pnpm/yarn run dev|start|serve|preview, "
+            "npx vite, php artisan serve."
+        )
+    for arg in extras:
+        if not _DEV_EXTRA_ARG.fullmatch(arg):
+            return None, (
+                f"Argument {arg!r} is not allowed. Only --port N and --host 127.0.0.1 "
+                "(localhost) may be added."
+            )
+    if base == "php" and not any(a.startswith("--host") for a in argv):
+        argv.append("--host=127.0.0.1")
+    return argv, None
+
+
+def _dev_key(workspace: Path, name: str) -> str:
+    return f"{workspace}|{name}"
+
+
+def _dev_alive(entry: dict[str, Any]) -> bool:
+    return entry["process"].poll() is None
+
+
+def _dev_log_tail(entry: dict[str, Any], chars: int = 2500) -> str:
+    try:
+        with open(entry["log"], "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - chars * 4))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "(log unavailable)"
+    return _ANSI.sub("", text).strip()[-chars:]
+
+
+def _dev_url(entry: dict[str, Any]) -> str | None:
+    try:
+        text = _ANSI.sub("", Path(entry["log"]).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    match = _DEV_URL.search(text)
+    if not match:
+        return None
+    return match.group(0).replace("0.0.0.0", "127.0.0.1").rstrip("/.,")
+
+
+def managed_ports() -> set[int]:
+    """Localhost ports of dev servers started by this agent that are still running."""
+    ports: set[int] = set()
+    for entry in _DEV_SERVERS.values():
+        if _dev_alive(entry):
+            url = _dev_url(entry)
+            match = _DEV_URL.match(url or "")
+            if match:
+                ports.add(int(match.group(1)))
+    return ports
+
+
+def _stop_dev(entry: dict[str, Any]) -> None:
+    process = entry["process"]
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            process.wait()
+    try:
+        os.unlink(entry["log"])
+    except OSError:
+        pass
+
+
+def stop_all_dev_servers() -> None:
+    for entry in list(_DEV_SERVERS.values()):
+        _stop_dev(entry)
+    _DEV_SERVERS.clear()
+
+
+atexit.register(stop_all_dev_servers)
+
+
+def dev_server(
+    action: str,
+    name: str | None = None,
+    command: str | None = None,
+    cwd: str | None = None,
+    cancel: threading.Event | None = None,
+) -> str:
+    workspace = Path(cwd or os.getcwd()).resolve()
+    action = (action or "").strip().lower()
+
+    if action == "status":
+        rows = []
+        for key, entry in _DEV_SERVERS.items():
+            if key.startswith(f"{workspace}|"):
+                state = "running" if _dev_alive(entry) else f"exited ({entry['process'].returncode})"
+                rows.append(f"{entry['name']}: {state}, {entry['command']}, url {_dev_url(entry) or 'unknown'}")
+        return "\n".join(rows) or "No dev servers have been started in this workspace."
+
+    if not name or not _DEV_NAME.fullmatch(name):
+        return "Rejected: name must be 1-20 lowercase letters, digits, - or _ (for example 'vite' or 'laravel')."
+    key = _dev_key(workspace, name)
+    entry = _DEV_SERVERS.get(key)
+
+    if action == "stop":
+        if not entry:
+            return f"No dev server named {name}."
+        _stop_dev(entry)
+        del _DEV_SERVERS[key]
+        return f"Stopped {name}."
+
+    if action == "logs":
+        if not entry:
+            return f"No dev server named {name}."
+        state = "running" if _dev_alive(entry) else f"exited with code {entry['process'].returncode}"
+        return f"[{name}: {state}]\n{_dev_log_tail(entry, 4000)}"
+
+    if action != "start":
+        return "Rejected: action must be start, stop, logs or status."
+
+    if entry and _dev_alive(entry):
+        return f"{name} is already running at {_dev_url(entry) or 'an unknown URL'}. Use action=logs to see its output."
+    if entry:
+        _stop_dev(entry)
+        del _DEV_SERVERS[key]
+    if sum(1 for e in _DEV_SERVERS.values() if _dev_alive(e)) >= MAX_DEV_SERVERS:
+        return f"Rejected: at most {MAX_DEV_SERVERS} dev servers can run at once. Stop one first."
+    if workspace == HOME or workspace in HOME.parents:
+        return "Rejected: open a project folder first; the home directory cannot be used."
+
+    argv, error = validate_dev_command(command or "")
+    if error:
+        return f"Rejected: {error}"
+
+    env = {
+        **os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0", "BROWSER": "none",
+        "COMPOSER_NO_INTERACTION": "1", "PAGER": "cat",
+    }
+    env["PATH"] = _extend_path(env.get("PATH", ""))
+    if _find_executable(argv[0], env, workspace) is None:
+        return f"Command not found: {argv[0]}. It may not be installed or not on the agent's PATH."
+
+    launch, run_env = argv, env
+    if SANDBOX_MODE != "off":
+        wrapped = sandbox_wrap(argv, workspace, env)
+        if wrapped is not None:
+            launch, run_env = wrapped, sandbox_env(env)
+            run_env["BROWSER"] = "none"
+        elif SANDBOX_MODE == "require":
+            return "Rejected: the sandbox is required but cannot be used here."
+        else:
+            log.warning("Starting dev server %r without a sandbox", argv[0])
+
+    handle, log_path = tempfile.mkstemp(prefix="agent-dev-", suffix=".log")
+    try:
+        process = subprocess.Popen(
+            launch, cwd=workspace, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+            env=run_env, start_new_session=True,
+        )
+    except OSError as exc:
+        os.close(handle)
+        os.unlink(log_path)
+        return f"Could not start the server: {exc}"
+    os.close(handle)
+    entry = {"name": name, "command": shlex.join(argv), "process": process, "log": log_path}
+    _DEV_SERVERS[key] = entry
+
+    deadline = time.monotonic() + DEV_START_WAIT
+    while time.monotonic() < deadline:
+        if cancel is not None and cancel.is_set():
+            _stop_dev(entry)
+            del _DEV_SERVERS[key]
+            return "Cancelled by the user; the server was stopped."
+        if process.poll() is not None:
+            tail = _dev_log_tail(entry)
+            del _DEV_SERVERS[key]
+            return f"The server exited immediately (code {process.returncode}):\n{tail}"
+        url = _dev_url(entry)
+        if url:
+            time.sleep(1.0)  # let it print any startup errors
+            if process.poll() is not None:
+                return f"The server exited after starting (code {process.returncode}):\n{_dev_log_tail(entry)}"
+            return f"Started {name} at {url}\n{_dev_log_tail(entry, 1200)}"
+        time.sleep(0.5)
+    return (
+        f"Started {name} but no URL appeared in its output after {DEV_START_WAIT}s. "
+        f"It is still running. Output so far:\n{_dev_log_tail(entry, 1500)}"
+    )
+
+
+class _LocalRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = urllib.parse.urlparse(newurl).hostname
+        if host not in LOCAL_HOSTS:
+            raise urllib.error.URLError("redirect to a non-local host was blocked")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _LocalRedirects())
+
+
+def local_url_problem(url: str) -> tuple[urllib.parse.ParseResult | None, str | None]:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        parsed.port  # validates the port
+    except ValueError:
+        return None, "that is not a valid URL."
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None, "provide a complete http://localhost:PORT/ URL."
+    if parsed.username or parsed.password:
+        return None, "URLs with embedded credentials are not allowed."
+    if parsed.hostname not in LOCAL_HOSTS:
+        return None, "check_app only opens localhost, 127.0.0.1 or ::1. Use web_fetch for public sites."
+    return parsed, None
+
+
+def _visible_text(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style|noscript|template)\b.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    import html as html_lib
+    return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+
+
+def _find_browser() -> tuple[str, str] | None:
+    """(path, family) of the browser to use; family is "firefox" or "chromium"."""
+    override = os.environ.get("OLLAMA_AGENT_BROWSER", "").strip()
+    if override:
+        found = shutil.which(override)
+        if not found:
+            return None
+        return found, "firefox" if re.search(r"zen|firefox|librewolf|floorp", Path(found).name, re.I) else "chromium"
+    for family, names in (("chromium", BROWSER_NAMES), ("firefox", FIREFOX_NAMES)):
+        for candidate in names:
+            found = shutil.which(candidate)
+            if found:
+                return found, family
+    return None
+
+
+def _firefox_screenshot(browser: str, url: str, shot: Path) -> str:
+    """Screenshot with Zen/Firefox headless. Returns an error text, or "" on success.
+
+    Firefox has no console or DOM dump on the command line, so this is screenshot only.
+    External hosts are blocked by pointing the proxy at a closed port for everything except localhost.
+    """
+    profile = tempfile.mkdtemp(prefix="agent-browser-")
+    try:
+        Path(profile, "user.js").write_text(
+            'user_pref("network.proxy.type", 1);\n'
+            'user_pref("network.proxy.http", "127.0.0.1");\n'
+            'user_pref("network.proxy.http_port", 9);\n'
+            'user_pref("network.proxy.ssl", "127.0.0.1");\n'
+            'user_pref("network.proxy.ssl_port", 9);\n'
+            'user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, [::1]");\n'
+            'user_pref("network.proxy.allow_hijacking_localhost", false);\n'
+            'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
+            'user_pref("app.update.auto", false);\n'
+            'user_pref("browser.shell.checkDefaultBrowser", false);\n',
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [browser, "--headless", "--no-remote", "--profile", profile,
+             "--window-size", "1280,900", "--screenshot", str(shot), url],
+            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, errors="replace",
+        )
+        return "" if shot.is_file() else (result.stderr or result.stdout or "no output")[-300:].strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+_CONSOLE_ERROR_WORDS = re.compile(r"(?i)uncaught|error|failed|unhandled|cannot|not defined|404|500|refused")
+_CONSOLE_LINE = re.compile(r":(ERROR|WARNING|INFO|VERBOSE\d?):CONSOLE[^\]]*\]\s*(.*)")
+
+
+def _run_browser(browser: str, url: str, extra: list[str], timeout: int = 45) -> subprocess.CompletedProcess:
+    profile = tempfile.mkdtemp(prefix="agent-browser-")
+    try:
+        return subprocess.run(
+            [
+                browser, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+                "--disable-extensions", "--disable-background-networking",
+                "--window-size=1280,900", "--virtual-time-budget=10000",
+                "--enable-logging=stderr", "--v=0", f"--user-data-dir={profile}",
+                # Only localhost may be reached; external CDNs and trackers are blocked.
+                "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE 127.0.0.1",
+                *extra, url,
+            ],
+            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            errors="replace",
+        )
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def _queue_screenshot(shot: Path, report: list[str]) -> None:
+    try:
+        if shot.stat().st_size <= 5_000_000 and model_supports_vision() is not False:
+            with _TOOL_IMAGES_LOCK:
+                _TOOL_IMAGES.append(base64.b64encode(shot.read_bytes()).decode("ascii"))
+            report.append("A screenshot of the page is attached in the next message.")
+        elif model_supports_vision() is False:
+            report.append(f"Model {MODEL} has no vision support, so the screenshot was not sent.")
+    except OSError:
+        pass
+
+
+def check_app(url: str) -> str:
+    """Load a localhost page, report what rendered, and attach a screenshot."""
+    parsed, problem = local_url_problem(url)
+    if problem:
+        return f"Rejected: {problem}"
+
+    problems: list[str] = []
+    report = [f"[check_app] {url}"]
+
+    # 1. Plain HTTP request: status, title and error pages.
+    status = None
+    body = ""
+    ctype = ""
+    request = urllib.request.Request(url, headers={"User-Agent": "Zed-Ollama-Agent/1.0", "Accept": "text/html,*/*"})
+    try:
+        try:
+            with _LOCAL_OPENER.open(request, timeout=20) as response:
+                status, ctype = response.status, response.headers.get("Content-Type", "")
+                body = response.read(300_000).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            status, ctype = exc.code, exc.headers.get("Content-Type", "")
+            body = exc.read(300_000).decode("utf-8", errors="replace")
+    except Exception as exc:
+        return (
+            f"Could not reach {url}: {exc}. Is the server running? Use dev_server with "
+            "action=status or action=logs."
+        )
+    title = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    report.append(f"HTTP {status}, {ctype or 'unknown type'}" + (f", title: {re.sub(chr(10), ' ', title.group(1)).strip()[:200]}" if title else ""))
+    if status >= 400:
+        problems.append(f"HTTP status {status}")
+    markers = [m for m in APP_ERROR_MARKERS if m in body]
+    if markers:
+        problems.append("error page markers in the HTML: " + ", ".join(markers))
+    text = _visible_text(body) if "html" in ctype.lower() or body.lstrip().startswith("<") else body
+    if status < 400 and not markers:
+        report.append(f"Page text (start): {text[:500]}")
+    else:
+        report.append(f"Error page text: {text[:1500]}")
+
+    # 2. Headless browser: rendered DOM, console errors, screenshot.
+    found = _find_browser()
+    if found is None:
+        report.append(
+            "Browser check skipped: no supported browser was found (Zen, Firefox or a Chromium "
+            "based browser). Only the HTTP check was done. Set OLLAMA_AGENT_BROWSER to its command."
+        )
+    elif found[1] == "firefox":
+        shot = Path(tempfile.mkdtemp(prefix="agent-shot-")) / "page.png"
+        error = _firefox_screenshot(found[0], url, shot)
+        if error:
+            report.append(f"Screenshot failed ({Path(found[0]).name}): {error}")
+        else:
+            report.append(
+                f"Screenshot taken with {Path(found[0]).name}. Zen/Firefox cannot report console "
+                "errors from the command line, so check the screenshot and the dev server logs."
+            )
+            _queue_screenshot(shot, report)
+        shutil.rmtree(shot.parent, ignore_errors=True)
+    else:
+        browser = found[0]
+        shot = Path(tempfile.mkdtemp(prefix="agent-shot-")) / "page.png"
+        try:
+            shot_run = _run_browser(browser, url, [f"--screenshot={shot}"])
+            dom_run = _run_browser(browser, url, ["--dump-dom"])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            report.append(f"Browser check failed: {exc}")
+            shot_run = dom_run = None
+        if dom_run is not None:
+            dom = dom_run.stdout or ""
+            rendered = _visible_text(dom)
+            report.append(f"Rendered text length: {len(rendered)} characters.")
+            if not rendered:
+                problems.append("the page rendered no visible text (blank page; check the console errors)")
+            if "vite-error-overlay" in dom:
+                problems.append("Vite error overlay is showing")
+            errors, messages_seen = [], []
+            seen: set[str] = set()
+            for line in (dom_run.stderr + "\n" + shot_run.stderr).splitlines():
+                m = _CONSOLE_LINE.search(line)
+                if not m or m.group(2) in seen:
+                    continue
+                seen.add(m.group(2))
+                text = m.group(2)[:300]
+                # Chromium logs most console output at INFO, so judge by level and wording.
+                if m.group(1) == "ERROR" or _CONSOLE_ERROR_WORDS.search(text):
+                    errors.append(text)
+                elif "[vite] " not in text:
+                    messages_seen.append(text)
+            if errors:
+                problems.append(f"{len(errors)} browser console error(s)")
+                report.append("Console errors:\n" + "\n".join(f"  - {e}" for e in errors[:10]))
+            if messages_seen:
+                report.append("Other console messages (judge whether they matter):\n" + "\n".join(f"  - {w}" for w in messages_seen[:8]))
+            if not errors and not messages_seen:
+                report.append("Console: no errors or messages.")
+            if shot.is_file():
+                _queue_screenshot(shot, report)
+            else:
+                report.append("No screenshot could be taken: " + (shot_run.stderr or "")[-300:].strip())
+        shutil.rmtree(shot.parent, ignore_errors=True)
+
+    report.append(
+        "PROBLEMS FOUND: " + "; ".join(problems) if problems
+        else "No problems detected by the automated checks."
+    )
+    return "\n".join(report)
+
+
+def tool_needs_gate(name: str, args: dict[str, Any]) -> bool:
+    """Whether a tool call must be approved by the user in Zed."""
+    if name in {"write_file", "edit_file", "run_tests", "setup_test_env"}:
+        return True
+    if name == "run_command":
+        return command_needs_approval(str(args.get("command", "")))
+    if name == "dev_server":
+        return str(args.get("action", "")).strip().lower() == "start"
+    if name == "check_app":
+        parsed, problem = local_url_problem(str(args.get("url", "")))
+        return bool(parsed and not problem and (parsed.port or 80) not in managed_ports())
+    return False
+
+
 # ---------------------------------------------------------------------------
 # System diagnostics
 # ---------------------------------------------------------------------------
@@ -3399,6 +4000,15 @@ def call_tool(
         if name == "forget":
             return forget(str(args.get("text", "")))
 
+        if name == "dev_server":
+            return dev_server(
+                str(args.get("action", "")), args.get("name"), args.get("command"),
+                cwd=cwd, cancel=cancel,
+            )
+
+        if name == "check_app":
+            return _untrusted(check_app(str(args.get("url", ""))))
+
         if name == "web_search":
             return _untrusted(web_search(str(args.get("query", ""))))
 
@@ -3429,6 +4039,8 @@ TOOL_ARG_KEYS = {
     "forget": {"text"},
     "web_search": {"query"},
     "web_fetch": {"url"},
+    "dev_server": {"action", "name", "command"},
+    "check_app": {"url"},
 }
 
 _ARG_ALIASES = {
@@ -3501,8 +4113,11 @@ def validate_tool_arguments(name: str, args: Any) -> str | None:
         "forget": ("text",),
         "web_search": ("query",),
         "web_fetch": ("url",),
+        "dev_server": ("action",),
+        "check_app": ("url",),
     }
     optional_strings = {
+        "dev_server": ("name", "command"),
         "list_files": ("path",),
         "search_files": ("path",),
         "run_tests": ("command", "directory"),
@@ -3551,8 +4166,10 @@ def validate_tool_arguments(name: str, args: Any) -> str | None:
             problem = _env_problem(args["env"])
             if problem:
                 return problem
-    if name == "setup_test_env" and args.get("kind", "auto") not in {"auto", "python", "node"}:
-        return "kind must be auto, python or node."
+    if name == "setup_test_env" and args.get("kind", "auto") not in {"auto", "python", "node", "php"}:
+        return "kind must be auto, python, node or php."
+    if name == "dev_server" and args.get("action") not in {"start", "stop", "logs", "status"}:
+        return "action must be start, stop, logs or status."
     if name == "write_file" and "append" in args and not isinstance(args["append"], bool):
         return "The append argument must be a Boolean."
     if name == "system_info" and args.get("category") not in categories:
@@ -3740,6 +4357,11 @@ class OllamaZedAgent(Agent):
         if name == "run_tests":
             # Test runs are sandboxed, so one approval can cover the whole session.
             return "run_tests"
+        if name == "dev_server":
+            return "dev_server"
+        if name == "check_app":
+            parsed, _ = local_url_problem(str(args.get("url", "")))
+            return f"app_port:{parsed.port or 80}" if parsed else None
         if name == "run_command":
             argv, error = validate_command(str(args.get("command", "")))
             if error or not argv:
@@ -3813,7 +4435,10 @@ class OllamaZedAgent(Agent):
         self, session_id: str, name: str, args: dict[str, Any]
     ) -> bool:
         """Request native Zed approval with an action preview."""
-        if name not in {"write_file", "edit_file", "run_command", "run_tests", "setup_test_env"}:
+        if name not in {
+            "write_file", "edit_file", "run_command", "run_tests", "setup_test_env",
+            "dev_server", "check_app",
+        }:
             return True
 
         key = (
@@ -3866,6 +4491,23 @@ class OllamaZedAgent(Agent):
                 "only inside the workspace (.venv or node_modules). Node install scripts are "
                 "disabled."
             )
+        elif name == "dev_server":
+            kind = "execute"
+            title = f"Start dev server: {str(args.get('command', ''))[:160]}"
+            preview = (
+                f"Command (kept running until stopped):\n```sh\n{clip(str(args.get('command', '')), 2000)}\n```\n"
+                "Runs in the sandbox: it can write only inside the workspace and has network "
+                "access. It listens on localhost only. The project's own dev script runs, so "
+                "check package.json first if you do not trust the project."
+            )
+        elif name == "check_app":
+            kind = "fetch"
+            title = f"Open local page: {str(args.get('url', ''))[:160]}"
+            preview = (
+                f"URL: {args.get('url')}\n\nThis port was not started by the agent. The agent "
+                "will load the page (GET only) and, if a browser is installed, render it "
+                "headlessly with external hosts blocked."
+            )
         elif name == "run_tests":
             kind = "execute"
             workspace = Path(self.session_cwds.get(session_id, os.getcwd())).resolve()
@@ -3916,6 +4558,10 @@ class OllamaZedAgent(Agent):
                 scope = "file writes and edits"
             elif key == "run_tests":
                 scope = "sandboxed test runs"
+            elif key == "dev_server":
+                scope = "starting dev servers"
+            elif key.startswith("app_port:"):
+                scope = f"opening localhost:{key[9:]}"
             else:
                 scope = f"`{key[4:]}`"
             options.append(
@@ -4337,6 +4983,7 @@ class OllamaZedAgent(Agent):
 
                 rejected_action = False
 
+                pending_shots: list[str] = []
                 for call in tool_calls:
                     if not isinstance(call, dict):
                         final_text = "Invalid tool call received; no action was performed."
@@ -4412,10 +5059,7 @@ class OllamaZedAgent(Agent):
                         })
                         continue
 
-                    needs_gate = name in {"write_file", "edit_file", "run_tests", "setup_test_env"} or (
-                        name == "run_command"
-                        and command_needs_approval(str(args.get("command", "")))
-                    )
+                    needs_gate = tool_needs_gate(name, args)
 
                     if needs_gate and READ_ONLY_MODE:
                         messages.append({
@@ -4490,9 +5134,17 @@ class OllamaZedAgent(Agent):
                     })
                     failure_streak = failure_streak + 1 if is_failed_result(observation) else 0
 
+                    shots = drain_tool_images()
+                    if shots:
+                        pending_shots.extend(shots)
+
                     if cancel.is_set():
                         cancelled = True
                         break
+
+                if pending_shots:
+                    attach_screenshots(messages, pending_shots, "latest page checked")
+                    pending_shots = []
 
                 if cancelled or rejected_action:
                     break
