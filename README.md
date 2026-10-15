@@ -26,3 +26,7 @@ under the "Hypr Agent" entry are kept.
 Settings are environment variables documented at the top of `hypr_agent_zed.py`
 (`OLLAMA_AGENT_THINK`, `OLLAMA_AGENT_SANDBOX`, `OLLAMA_AGENT_WRITE_HOME`, ...). Set them in
 the "Hypr Agent" `env` block in Zed's settings.
+
+## Vision / screenshots
+
+The agent advertises image support to Zed, so you can paste or attach screenshots to a message. Images are sent to Ollama for that turn only (not kept in history). This needs a vision-capable model, e.g. `OLLAMA_AGENT_MODEL=qwen2.5vl:7b` (also gemma3, llama3.2-vision). If the model reports no vision capability the agent says so instead of sending the image. Limits: 4 images per message, 10 MB each.

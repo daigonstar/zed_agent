@@ -24,6 +24,32 @@ def _workspace() -> Path:
     return Path(tempfile.mkdtemp(prefix="agent-test-")).resolve()
 
 
+class ImageAttachmentTests(unittest.TestCase):
+    def test_reads_inline_and_rejects_bad_images(self):
+        import base64
+        agent = h.OllamaZedAgent()
+        agent.session_cwds["s"] = str(_workspace())
+        png = base64.b64encode(b"\x89PNG fake").decode()
+        images, notes = agent._read_images("s", [
+            {"type": "image", "data": png, "mime_type": "image/png"},
+            {"type": "image", "data": png, "mime_type": "text/plain"},
+            {"type": "text", "text": "hi"},
+        ])
+        self.assertEqual(images, [png])
+        self.assertEqual(len(notes), 1)
+
+
+class SyntaxCheckTests(unittest.TestCase):
+    def test_write_and_edit_report_syntax(self):
+        ws = _workspace()
+        ok = h.write_file("a.py", "x = 1\n", cwd=str(ws))
+        self.assertIn("Syntax check: OK", ok)
+        bad = h.edit_file("a.py", "x = 1", "x = (1", cwd=str(ws))
+        self.assertIn("SYNTAX ERROR", bad)
+        self.assertIn("not available", h.write_file("n.txt", "hi", cwd=str(ws)))
+        self.assertIn("SYNTAX ERROR", h.write_file("b.json", "{", cwd=str(ws)))
+
+
 class EditFileTests(unittest.TestCase):
     def setUp(self):
         self.ws = _workspace()
