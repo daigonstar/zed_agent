@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import threading
@@ -46,6 +47,17 @@ class EditFileTests(unittest.TestCase):
         self.assertTrue(result.startswith("Edited"), result)
         self.assertEqual(self.file.read_text(), "class A:\n    KEEP = 5\n    y = 1\n")
 
+    def test_read_file_line_numbers_are_stripped(self):
+        result = self.edit('2:     KEEP = os.environ.get("X", "30m")\n3:     y = 1',
+                           '2:     KEEP = 5\n3:     y = 2')
+        self.assertTrue(result.startswith("Edited"), result)
+        self.assertEqual(self.file.read_text(), "class A:\n    KEEP = 5\n    y = 2\n")
+
+    def test_line_numbers_in_old_only(self):
+        result = self.edit("3:     y = 1", "    y = 2")
+        self.assertTrue(result.startswith("Edited"), result)
+        self.assertIn("    y = 2\n", self.file.read_text())
+
     def test_missing_shows_closest_line(self):
         result = self.edit('KEEP = os.environ.get("Z", "30m")', "q")
         self.assertIn("not found", result)
@@ -67,6 +79,53 @@ class EditFileTests(unittest.TestCase):
         self.assertIn("Rejected", h.edit_file(".git/config", "x", "y", cwd=str(self.ws)))
         (self.ws / ".env").write_text("K=1")
         self.assertIn("Rejected", h.edit_file(".env", "K=1", "K=2", cwd=str(self.ws)))
+
+
+class EditPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.ws = _workspace()
+        (self.ws / "a.py").write_text("x = 1\ny = 2\n")
+
+    def test_prepare_edit_gives_full_before_and_after_without_writing(self):
+        error, planned = h._prepare_edit("a.py", "y = 2", "y = 3", cwd=str(self.ws))
+        self.assertIsNone(error)
+        path, before, after, _ = planned
+        self.assertEqual((before, after), ("x = 1\ny = 2\n", "x = 1\ny = 3\n"))
+        self.assertEqual((self.ws / "a.py").read_text(), "x = 1\ny = 2\n")
+
+    def test_prepare_edit_reports_errors(self):
+        error, planned = h._prepare_edit("a.py", "nope", "z", cwd=str(self.ws))
+        self.assertIsNone(planned)
+        self.assertIn("not found", error)
+
+    def test_agent_builds_diff_for_edit_and_new_file(self):
+        agent = h.OllamaZedAgent()
+        agent.session_cwds["s"] = str(self.ws)
+        edit = agent._file_diff("s", "edit_file", {"path": "a.py", "old": "y = 2", "new": "y = 3"})
+        self.assertEqual((edit[0].old_text, edit[0].new_text), ("x = 1\ny = 2\n", "x = 1\ny = 3\n"))
+        new = agent._file_diff("s", "write_file", {"path": "n.txt", "content": "hi"})
+        self.assertIsNone(new[0].old_text)
+        self.assertEqual(new[0].new_text, "hi")
+        self.assertIsNone(agent._file_diff("s", "edit_file", {"path": "a.py", "old": "nope", "new": "z"}))
+
+
+class SessionLogTests(unittest.TestCase):
+    def setUp(self):
+        self._path = h.SESSION_LOG
+        h.SESSION_LOG = _workspace() / "session.jsonl"
+
+    def tearDown(self):
+        h.SESSION_LOG = self._path
+
+    def test_reset_empties_and_events_append(self):
+        h.log_event("user", text="old")
+        h.reset_session_log()
+        self.assertEqual(h.SESSION_LOG.read_text(), "")
+        h.log_event("tool", tool="edit_file", result="x" * (h.SESSION_LOG_MAX_CHARS + 10))
+        entry = json.loads(h.SESSION_LOG.read_text())
+        self.assertEqual(entry["event"], "tool")
+        self.assertIn("more chars", entry["result"])
+        self.assertEqual(oct(h.SESSION_LOG.stat().st_mode & 0o777), "0o600")
 
 
 class WriteFileTests(unittest.TestCase):
@@ -142,6 +201,96 @@ class CommandPolicyTests(unittest.TestCase):
         ):
             argv, err = h.validate_test_command(bad, ws)
             self.assertIsNone(argv, bad)
+
+
+class GitPolicyTests(unittest.TestCase):
+    def test_everything_useful_is_allowed_with_approval(self):
+        for cmd in (
+            "git push origin main", "git pull --rebase", "git fetch --all", "git merge dev --no-edit",
+            "git rebase main", "git reset --hard HEAD~1", "git revert abc123", "git cherry-pick -x abc",
+            "git clean -fd", "git switch -c feature", "git checkout -b x", "git stash pop",
+            "git commit -c abc123", "git remote add origin git@github.com:a/b.git",
+            "git config user.name robb", "git submodule update --init", "git branch -D old",
+        ):
+            argv, err = h.validate_command(cmd)
+            self.assertIsNone(err, cmd)
+            self.assertTrue(h.command_needs_approval(cmd), cmd)
+
+    def test_read_only_queries_need_no_approval(self):
+        for cmd in ("git status", "git log -n 5", "git blame a.py", "git --no-pager diff", "git grep foo"):
+            self.assertFalse(h.command_needs_approval(cmd), cmd)
+
+    def test_code_running_forms_are_refused(self):
+        for cmd in (
+            "git -c core.pager=sh log", "git -C /etc status", "git --git-dir=/x status",
+            "git filter-branch --tree-filter x", "git difftool", "git rebase -x make main",
+            "git rebase --exec make main", "git bisect run make", "git submodule foreach ls",
+            "git clone -c core.sshCommand=x url", "git clone -u x url",
+            "git remote add o ext::sh", "git push --receive-pack=x origin",
+            "git config core.sshCommand x", "git config alias.x !sh", "git config --global user.name x",
+            "git config credential.helper store", "git grep -Osh foo", "git log --output=x",
+            "git co", "git",
+        ):
+            argv, err = h.validate_command(cmd)
+            self.assertIsNone(argv, cmd)
+
+    def test_remote_detection_and_session_approval(self):
+        self.assertTrue(h.git_is_remote(["push", "origin"]))
+        self.assertTrue(h.git_is_remote(["remote", "update"]))
+        self.assertFalse(h.git_is_remote(["remote", "add", "o", "u"]))
+        self.assertFalse(h.git_is_remote(["commit", "-m", "x"]))
+        self.assertTrue(h.git_session_approvable(["commit", "-m", "x"]))
+        for args in (["push"], ["reset", "--hard"], ["commit", "--amend"], ["clean", "-fd"], ["checkout", "."]):
+            self.assertFalse(h.git_session_approvable(args), args)
+
+    def test_paths_outside_workspace_refused(self):
+        ws = _workspace()
+        self.assertIn("outside", h.git_path_problem(["clone", "https://x/y", "/tmp/elsewhere"], ws))
+        self.assertIn("outside", h.git_path_problem(["format-patch", "-o", "../x", "HEAD~1"], ws))
+        self.assertIsNone(h.git_path_problem(["remote", "add", "backup", "/mnt/backup/r.git"], ws))
+        self.assertIsNone(h.git_path_problem(["clone", "/mnt/src/repo", "sub"], ws))
+        self.assertIn("outside", h.git_path_problem(["archive", "--prefix=p/", "-o", "../a.tar", "HEAD"], ws))
+        self.assertIsNone(h.git_path_problem(["clone", "git@github.com:a/b.git", "sub"], ws))
+        self.assertIsNone(h.git_path_problem(["add", "src/a.py"], ws))
+        self.assertIsNone(h.git_path_problem(["log", "main..origin/main"], ws))
+
+
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class GitEndToEndTests(unittest.TestCase):
+    def test_commit_push_pull_and_reset(self):
+        root = _workspace()
+        remote, ws, other = root / "remote.git", root / "ws", root / "other"
+        ws.mkdir()
+        other.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+        old_env = dict(os.environ)
+        os.environ.update(env)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(old_env)))
+        import subprocess
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+
+        def run(cwd, command):
+            return h.run_command(command, cwd=str(cwd))
+
+        self.assertNotIn("Rejected", run(ws, "git init -b main"))
+        (ws / "a.txt").write_text("one\n")
+        run(ws, "git add a.txt")
+        self.assertIn("a.txt", run(ws, 'git commit -m first'))
+        run(ws, f"git remote add origin {remote}")
+        pushed = run(ws, "git push -u origin main")
+        self.assertNotIn("Rejected", pushed)
+        self.assertIn("first", subprocess.run(["git", "--git-dir", str(remote), "log", "--oneline"],
+                                              capture_output=True, text=True).stdout)
+        # another clone pulls it, then the workspace resets back
+        subprocess.run(["git", "clone", "-q", str(remote), str(other / "c")], check=True)
+        (ws / "a.txt").write_text("two\n")
+        run(ws, "git commit -am second")
+        run(ws, "git push")
+        self.assertNotIn("Rejected", run(other / "c", "git pull"))
+        self.assertEqual((other / "c" / "a.txt").read_text(), "two\n")
+        run(ws, "git reset --hard HEAD~1")
+        self.assertEqual((ws / "a.txt").read_text(), "one\n")
 
 
 class SetupEnvTests(unittest.TestCase):

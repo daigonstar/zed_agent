@@ -15,6 +15,8 @@ Optional environment variables:
     OLLAMA_AGENT_NUM_CTX=32768
     OLLAMA_AGENT_MAX_TOOL_STEPS=40
     OLLAMA_AGENT_STATE_DIR=~/.local/share/zed-ollama-agent
+    OLLAMA_AGENT_SESSION_LOG=/path     (conversation log, emptied on every start; default
+                                        $XDG_RUNTIME_DIR/zed-ollama-agent-session.jsonl)
     OLLAMA_AGENT_SESSION_APPROVALS=1   (0 removes the "for this session" option)
     OLLAMA_AGENT_READ_ONLY=1           (refuse all changes and all non-read-only commands)
     OLLAMA_AGENT_SANDBOX=auto          (off | auto | require; needs the bubblewrap package)
@@ -73,7 +75,10 @@ from acp import (
 )
 from acp.schema import (
     ContentToolCallContent,
+    FileEditToolCallContent,
     PermissionOption,
+    ToolCallLocation,
+    ToolCallStart,
     ToolCallUpdate,
     AgentCapabilities,
     AgentMessageChunk,
@@ -130,7 +135,7 @@ def _parse_think(value: str):
 # The option is only sent when the loaded model reports the "thinking" capability
 # (see think_option()). Use "auto" to never send it.
 THINK = _parse_think(os.environ.get("OLLAMA_AGENT_THINK", "high"))
-KEEP_ALIVE = os.environ.get("OLLAMA_AGENT_KEEP_ALIVE", "30m")
+KEEP_ALIVE = os.environ.get("OLLAMA_AGENT_KEEP_ALIVE", "30s")
 
 # Optional: stop a step whose reasoning runs past this many characters and redo it
 # without thinking. Off by default so reasoning always stays visible; 0 disables.
@@ -205,6 +210,42 @@ logging.basicConfig(
 )
 log = logging.getLogger("zed-ollama-agent")
 
+# Conversation log for diagnosing problems: one JSON line per event (user message, model
+# reply, tool call, tool result). A fixed path in the temp folder, emptied on every start.
+SESSION_LOG = Path(
+    os.environ.get("OLLAMA_AGENT_SESSION_LOG")
+    or Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / "zed-ollama-agent-session.jsonl"
+).expanduser()
+SESSION_LOG_MAX_CHARS = 20_000  # per field; longer text is cut with a marker
+
+
+def reset_session_log() -> None:
+    try:
+        fd = os.open(SESSION_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(fd)
+    except OSError as exc:
+        log.warning("Could not create session log %s: %s", SESSION_LOG, exc)
+
+
+def log_event(kind: str, **fields: Any) -> None:
+    """Append one event to the session log. Never raises."""
+    def clip(value: Any) -> Any:
+        if isinstance(value, str) and len(value) > SESSION_LOG_MAX_CHARS:
+            return value[:SESSION_LOG_MAX_CHARS] + f"...[{len(value) - SESSION_LOG_MAX_CHARS} more chars]"
+        if isinstance(value, dict):
+            return {k: clip(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clip(v) for v in value]
+        return value
+
+    entry = {"time": time.strftime("%H:%M:%S"), "event": kind, **clip(fields)}
+    try:
+        fd = os.open(SESSION_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
 SYSTEM_PROMPT = f"""
 You are a capable Linux assistant integrated into the Zed editor.
 You use the local Ollama model configured by the user.
@@ -249,7 +290,8 @@ Tool-call rules:
 - If run_command rejects a command, read the rejection message to see what is allowed. Do not guess.
 - Commands run without a shell, so do not use pipes, redirects, semicolons, or &&. Nothing is expanded either: use real paths, not ~, $VARIABLES or wildcards. Use one command per call and pass non-interactive flags such as --no-interaction.
 - Build commands may run in a sandbox where only the workspace is writable. If a command fails with a read-only or missing-file error outside the workspace, say so instead of trying to work around it.
-- cp, mv, rm, rmdir, mkdir, touch and chmod only work on paths inside the workspace, and nothing inside a .git directory can be changed.
+- cp, mv, rm, rmdir, mkdir, touch and chmod only work on paths inside the workspace, and nothing inside a .git directory can be changed with them.
+- git works through run_command, one plain subcommand per call (git status, git add, git commit -m "msg", git push, git pull, git rebase, git reset ...). Everything except read-only queries asks the user for approval. Do not use global options (-c, -C), aliases, git config for programs/credentials, rebase --exec, filter-branch or difftool; they are refused. Remote commands (push, pull, fetch, clone) run outside the sandbox with the user's credentials; no editor opens, so always pass -m to git commit and --no-edit to git merge/revert where needed. Never force-push or reset --hard unless the user asked for exactly that.
 - bash and sh can only run a script file inside the workspace, as `bash scripts/setup.sh arg1 arg2`. Options such as -c are refused. Write the script with write_file first. Scripts run in the sandbox only, and the user reviews the whole script before approving, so keep each one short and readable.
 - Commands are killed after a timeout, so never start servers or watchers such as artisan serve or npm run dev.
 - If the workspace already holds files, scaffold new projects into a subfolder rather than the workspace root.
@@ -327,7 +369,8 @@ TOOLS = [
         "run_command",
         "Run one command without a shell (no pipes, redirects, semicolons or &&). "
         "Read-only commands run immediately. Build and project commands such as "
-        "composer, php, npm, npx, node, git add/commit/init, mkdir, cp, mv and rm ask "
+        "composer, php, npm, npx, node, git (everything except status/diff/log/show and "
+        "other read-only queries), mkdir, cp, mv and rm ask "
         "the user for approval first and may run for up to 15 minutes. "
         "Pass non-interactive flags such as --no-interaction."
         "Pass dry run related flags such as --dry-run",
@@ -820,15 +863,163 @@ DEV_COMMANDS = {
 }
 
 GIT_READONLY_SUBCOMMANDS = {
-    "status", "diff", "log", "show", "branch",
-    "remote", "rev-parse", "ls-files",
+    "status", "diff", "log", "show", "branch", "remote", "rev-parse", "ls-files",
+    "blame", "shortlog", "describe", "ls-tree", "cat-file", "rev-list", "show-ref",
+    "for-each-ref", "merge-base", "name-rev", "diff-tree", "count-objects",
+    "check-ignore", "cherry", "grep",
 }
 
-# Allowed after approval.
+# Allowed after approval. Subcommands not listed here or above are refused, which also
+# stops git aliases (they can run shell commands) and tools such as filter-branch,
+# difftool and mergetool that execute arbitrary programs.
 GIT_MUTATING_SUBCOMMANDS = {
-    "add", "commit", "init", "checkout", "switch", "restore",
-    "stash", "tag", "clone", "mv", "rm",
+    "add", "commit", "init", "checkout", "switch", "restore", "stash", "tag", "clone",
+    "mv", "rm", "push", "pull", "fetch", "merge", "rebase", "reset", "revert",
+    "cherry-pick", "clean", "am", "apply", "bisect", "submodule", "worktree", "notes",
+    "gc", "prune", "reflog", "config", "ls-remote", "format-patch", "archive",
 }
+
+# These contact a remote, so they run outside the sandbox (no network or credentials in it).
+GIT_REMOTE_SUBCOMMANDS = {"push", "pull", "fetch", "clone", "ls-remote", "submodule"}
+GIT_REMOTE_SUBCOMMAND_ARGS = {"remote": {"update", "prune", "show"}}
+
+# "Allow for this session" is only offered for these, and never with a destructive flag.
+GIT_SESSION_APPROVABLE = {
+    "add", "commit", "init", "switch", "stash", "tag", "mv", "merge", "cherry-pick", "revert",
+}
+GIT_DESTRUCTIVE_FLAGS = {
+    "-f", "--force", "--force-with-lease", "--force-if-includes", "--hard", "-D",
+    "--delete", "--prune", "--amend", "--no-verify", "-n",
+}
+
+# Options that run a program, or point git at paths outside the workspace.
+_GIT_BLOCKED_OPTIONS = {
+    "--exec", "--upload-pack", "--receive-pack", "--exec-path", "--git-dir", "--work-tree",
+    "--output", "--separate-git-dir", "--template", "--reference", "--reference-if-able",
+    "--open-files-in-pager", "--config-env", "--super-prefix",
+}
+_GIT_GLOBAL_OPTIONS_OK = {"--no-pager", "--no-optional-locks", "--no-replace-objects"}
+_GIT_TRANSPORT_HELPER = re.compile(r"(^|=)(ext|fd)::")
+# git config keys that make git run a program on later commands (even read-only ones).
+_GIT_CONFIG_RISKY_PREFIX = (
+    "alias.", "filter.", "include", "pager.", "credential.", "gpg.", "browser.", "web.",
+    "mergetool.", "difftool.", "sendemail.", "uploadpack.", "receive.", "safe.",
+    "protocol.", "url.", "trailer.", "maintenance.", "http.",
+)
+_GIT_CONFIG_RISKY_SUFFIX = (
+    ".command", ".textconv", ".cmd", ".driver", ".program", ".helper", ".sshcommand",
+    ".proxy", ".uploadpack", ".receivepack", ".editor", ".pager", ".external", ".update",
+)
+_GIT_CONFIG_RISKY_KEYS = {
+    "core.fsmonitor", "core.hookspath", "core.sshcommand", "core.editor", "core.pager",
+    "core.askpass", "core.gitproxy", "sequence.editor", "diff.external",
+}
+_GIT_CONFIG_BLOCKED_FLAGS = {
+    "--global", "--system", "--file", "-f", "--blob", "--worktree", "--edit", "-e", "--includes",
+}
+
+
+def git_subcommand(args: list[str]) -> str | None:
+    """The git subcommand, or None when there is none or a global option precedes it."""
+    for index, arg in enumerate(args):
+        if not arg.startswith("-"):
+            return arg if all(a in _GIT_GLOBAL_OPTIONS_OK for a in args[:index]) else None
+    return None
+
+
+def git_problem(args: list[str]) -> str | None:
+    """Why this git invocation is refused, or None when it may run (after approval if it changes things)."""
+    sub = git_subcommand(args)
+    allowed = GIT_READONLY_SUBCOMMANDS | GIT_MUTATING_SUBCOMMANDS
+    if sub is None or sub not in allowed:
+        return (
+            "This git command is not allowed (global options such as -c and -C, aliases and "
+            f"tools like filter-branch or difftool are refused). Read-only: "
+            f"{', '.join(sorted(GIT_READONLY_SUBCOMMANDS))}. With approval: "
+            f"{', '.join(sorted(GIT_MUTATING_SUBCOMMANDS))}."
+        )
+    rest = args[args.index(sub) + 1:]
+    for arg in rest:
+        if arg.split("=", 1)[0] in _GIT_BLOCKED_OPTIONS:
+            return f"The git option {arg.split('=', 1)[0]} is not allowed (it runs programs or leaves the workspace)."
+        if _GIT_TRANSPORT_HELPER.search(arg):
+            return "ext:: and fd:: git remotes run arbitrary commands and are not allowed."
+    if sub == "clone" and any(
+        a in {"-c", "--config"} or (a.startswith("-u") and not a.startswith("--")) for a in rest
+    ):
+        return "git clone -c/--config/-u can run programs and is not allowed."
+    if sub == "rebase" and ("-x" in rest or any(a.startswith("-x") for a in rest if not a.startswith("--"))):
+        return "git rebase -x/--exec runs commands and is not allowed."
+    if sub == "grep" and any(a.startswith("-O") for a in rest):
+        return "git grep -O opens a pager program and is not allowed."
+    positionals = [a for a in rest if not a.startswith("-")]
+    if sub == "bisect" and positionals[:1] == ["run"]:
+        return "git bisect run runs commands and is not allowed."
+    if sub == "submodule" and "foreach" in positionals:
+        return "git submodule foreach runs commands and is not allowed."
+    if sub == "config":
+        if any(a.split("=", 1)[0] in _GIT_CONFIG_BLOCKED_FLAGS for a in rest):
+            return "git config is limited to this repository's own settings (no --global/--system/--file/--edit)."
+        for item in positionals:
+            key = item.lower()
+            if "." in key and (
+                key.startswith(_GIT_CONFIG_RISKY_PREFIX)
+                or key.endswith(_GIT_CONFIG_RISKY_SUFFIX)
+                or key in _GIT_CONFIG_RISKY_KEYS
+            ):
+                return f"git config {item}: settings that make git run programs, proxies or credential helpers cannot be changed."
+    return None
+
+
+def git_is_remote(args: list[str]) -> bool:
+    """True when git will talk to a remote (needs network and the user's credentials)."""
+    sub = git_subcommand(args)
+    if sub in GIT_REMOTE_SUBCOMMANDS:
+        return True
+    rest = [a for a in args[args.index(sub) + 1:] if not a.startswith("-")] if sub else []
+    return bool(rest) and rest[0] in GIT_REMOTE_SUBCOMMAND_ARGS.get(sub, set())
+
+
+def git_session_approvable(args: list[str]) -> bool:
+    sub = git_subcommand(args)
+    return (
+        sub in GIT_SESSION_APPROVABLE
+        and not any(a in GIT_DESTRUCTIVE_FLAGS for a in args)
+        and not git_is_remote(args)
+    )
+
+
+# Subcommands that create or write files at a path the model names. Remote URLs and
+# local remote paths are fine (nothing is written there by the command line itself).
+_GIT_WRITES_AT_PATH = {"init", "clone", "worktree", "archive", "format-patch", "submodule"}
+
+
+def git_path_problem(args: list[str], workspace: Path) -> str | None:
+    """Reject git arguments that name a write location outside the workspace (clone target, -o file, ...)."""
+    sub = git_subcommand(args)
+    if sub not in _GIT_WRITES_AT_PATH:
+        return None
+    rest = args[args.index(sub) + 1:]
+    values = [
+        a.split("=", 1)[1] if a.startswith("--") and "=" in a else a
+        for a in rest if not a.startswith("-") or (a.startswith("--") and "=" in a)
+    ]
+    if sub == "clone":
+        positionals = [a for a in rest if not a.startswith("-")]
+        values = positionals[1:]  # the first is the source repository; the second is the target folder
+    for value in values:
+        if ":" in value or not value:
+            continue  # URLs, scp-style remotes and refspecs
+        if not (value.startswith(("/", "~")) or ".." in Path(value).parts):
+            continue
+        try:
+            path = Path(value).expanduser()
+            resolved = Path(os.path.abspath(path if path.is_absolute() else workspace / path)).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return f"'{value}' could not be resolved."
+        if resolved != workspace and workspace not in resolved.parents:
+            return f"'{value}' is outside the workspace ({workspace}); git may only write inside it."
+    return None
 
 
 def is_blocked_path(value: str) -> bool:
@@ -909,25 +1100,9 @@ def validate_command(command: str) -> tuple[list[str] | None, str | None]:
             return None, "Only read-only pacman query operations (-Q...) are allowed."
 
     if base == "git":
-        positionals = [arg for arg in args if not arg.startswith("-")]
-        allowed = GIT_READONLY_SUBCOMMANDS
-
-        if not positionals or (
-            positionals[0] not in allowed
-            and positionals[0] not in GIT_MUTATING_SUBCOMMANDS
-        ):
-            return None, (
-                "This git subcommand is not allowed. "
-                f"Read-only: {', '.join(sorted(allowed))}. "
-                f"With approval: {', '.join(sorted(GIT_MUTATING_SUBCOMMANDS))}."
-            )
-
-        if any(arg.startswith("--output") for arg in args):
-            return None, "Git output-to-file options are not allowed."
-
-        if positionals[0] == "remote":
-            if any(arg not in {"-v", "--verbose"} for arg in args[1:] if arg.startswith("-")):
-                return None, "Only read-only git remote queries are allowed."
+        problem = git_problem(args)
+        if problem:
+            return None, problem
 
     if base == "ollama":
         if not args or args[0] not in {"list", "ps", "show"}:
@@ -1034,6 +1209,8 @@ def check_file_command_paths(base: str, args: list[str], workspace: Path) -> str
 
     Returns a reason when a path argument is not allowed, otherwise None.
     """
+    if base == "git":
+        return git_path_problem(args, workspace)
     if base not in FILE_COMMANDS:
         return None
 
@@ -1583,8 +1760,12 @@ def run_command(
         "CI": "1",
         "npm_config_yes": "true",
         "GIT_TERMINAL_PROMPT": "0",
+        # No editor can open, so a commit without -m fails instead of hanging.
+        "GIT_EDITOR": "true",
+        "GIT_SEQUENCE_EDITOR": "true",
     }
     env["PATH"] = _extend_path(env.get("PATH", ""))
+    remote_git = base == "git" and git_is_remote(argv[1:])
 
     if mutating:
         reason = long_running_reason(argv)
@@ -1598,7 +1779,13 @@ def run_command(
         )
 
     launch = argv
-    if mutating and SANDBOX_MODE != "off":
+    if remote_git and SANDBOX_MODE == "require":
+        return (
+            "Rejected: this git command contacts a remote, which cannot run inside the sandbox "
+            "(no network or credentials), and OLLAMA_AGENT_SANDBOX=require forbids running it "
+            "outside. Run it yourself, or set OLLAMA_AGENT_SANDBOX=auto."
+        )
+    if mutating and SANDBOX_MODE != "off" and not remote_git:
         wrapped = sandbox_wrap(argv, workspace, env)
         if wrapped is not None:
             launch, env = wrapped, sandbox_env(env)
@@ -2658,6 +2845,17 @@ def write_file(path: str, content: str, append: bool = False, cwd: str | None = 
         return f"Write failed: {exc}"
 
 
+_LINE_NUMBER_PREFIX = re.compile(r"^\d+: ?", re.MULTILINE)
+
+
+def _strip_line_numbers(value: str) -> str | None:
+    """Remove read_file's "N: " prefixes if every non-blank line has one, else None."""
+    lines = [line for line in value.splitlines() if line.strip()]
+    if not lines or not all(_LINE_NUMBER_PREFIX.match(line) for line in lines):
+        return None
+    return _LINE_NUMBER_PREFIX.sub("", value)
+
+
 def _locate_edit(text: str, old: str, new: str):
     """Find the single place `old` belongs in `text`.
 
@@ -2682,6 +2880,12 @@ def _locate_edit(text: str, old: str, new: str):
                            new.replace('\\"', '"').replace("\\'", "'")))
     if "\r\n" in text and "\r\n" not in old:
         candidates.append((old.replace("\n", "\r\n"), new.replace("\n", "\r\n")))
+    # "12: text" prefixes copied from read_file output.
+    unnumbered = _strip_line_numbers(old)
+    if unnumbered is not None:
+        new_unnumbered = _strip_line_numbers(new)
+        candidates.append((unnumbered, new if new_unnumbered is None else new_unnumbered))
+        old, new = candidates[-1]
     for cand_old, cand_new in candidates[1:]:
         if cand_old and text.count(cand_old) == 1:
             start = text.index(cand_old)
@@ -2732,25 +2936,27 @@ def _locate_edit(text: str, old: str, new: str):
         hint = f" Closest line in the file is line {line_no}: {file_lines[line_no - 1].rstrip()!r}."
     return None, None, (
         "Rejected: 'old' was not found in the file." + hint +
-        " Use read_file on the relevant lines and copy the text exactly (no JSON escaping, "
-        "keep the indentation), or use a shorter single-line 'old'."
+        " Use read_file on the relevant lines and copy the text exactly (no line-number "
+        "prefixes, no JSON escaping, keep the indentation), or use a shorter single-line 'old'."
     )
 
 
-def edit_file(path: str, old: str, new: str, cwd: str | None = None) -> str:
-    """Replace one exact occurrence of text in an existing file."""
+def _prepare_edit(path: str, old: str, new: str, cwd: str | None = None):
+    """Validate an edit and work out its result without writing anything.
+
+    Returns (error, None) or (None, (resolved_path, old_text, new_text, note)).
+    """
     if not all(isinstance(value, str) for value in (path, old, new)):
-        return "Rejected: path, old and new must be strings."
+        return "Rejected: path, old and new must be strings.", None
     if not path or "\x00" in path:
-        return "Rejected: path is empty or invalid."
+        return "Rejected: path is empty or invalid.", None
     if not old:
-        return "Rejected: 'old' must not be empty."
+        return "Rejected: 'old' must not be empty.", None
     if len(new.encode("utf-8")) > MAX_WRITE_BYTES:
-        return f"Rejected: replacement exceeds {MAX_WRITE_BYTES} bytes."
+        return f"Rejected: replacement exceeds {MAX_WRITE_BYTES} bytes.", None
 
     try:
         workspace = Path(cwd or os.getcwd()).resolve()
-        home = Path.home().resolve()
         target = Path(path).expanduser()
         if not target.is_absolute():
             target = workspace / target
@@ -2760,22 +2966,22 @@ def edit_file(path: str, old: str, new: str, cwd: str | None = None) -> str:
         for part in target.parts[1:]:
             probe = probe / part
             if probe.is_symlink():
-                return "Rejected: paths containing symbolic links are not allowed."
+                return "Rejected: paths containing symbolic links are not allowed.", None
 
         resolved = target.resolve(strict=False)
         if not write_scope_ok(resolved, workspace):
-            return write_scope_error().replace("writes", "edits")
+            return write_scope_error().replace("writes", "edits"), None
         if is_blocked_path(str(resolved)):
-            return "Rejected: target is a sensitive path."
+            return "Rejected: target is a sensitive path.", None
         if ".git" in resolved.parts:
             return (
                 "Rejected: writing inside a .git directory is not allowed "
                 "(hooks and config can run code)."
-            )
+            ), None
         if not resolved.is_file():
-            return f"Not a file: {resolved}. Use write_file to create new files."
+            return f"Not a file: {resolved}. Use write_file to create new files.", None
         if resolved.stat().st_size > MAX_WRITE_BYTES:
-            return f"Rejected: file is larger than {MAX_WRITE_BYTES} bytes."
+            return f"Rejected: file is larger than {MAX_WRITE_BYTES} bytes.", None
 
         # newline="" keeps the file's existing line endings untouched.
         with resolved.open("r", encoding="utf-8", newline="") as handle:
@@ -2783,16 +2989,26 @@ def edit_file(path: str, old: str, new: str, cwd: str | None = None) -> str:
 
         span, replacement, note = _locate_edit(text, old, new)
         if span is None:
-            return note
-
-        with resolved.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(text[:span[0]] + replacement + text[span[1]:])
-
-        return f"Edited {resolved}.{note}"
+            return note, None
+        return None, (resolved, text, text[:span[0]] + replacement + text[span[1]:], note)
     except UnicodeDecodeError:
-        return "Rejected: file is not valid UTF-8 text."
+        return "Rejected: file is not valid UTF-8 text.", None
+    except Exception as exc:
+        return f"Edit failed: {exc}", None
+
+
+def edit_file(path: str, old: str, new: str, cwd: str | None = None) -> str:
+    """Replace one exact occurrence of text in an existing file."""
+    error, planned = _prepare_edit(path, old, new, cwd)
+    if planned is None:
+        return error
+    resolved, _, new_text, note = planned
+    try:
+        with resolved.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
     except Exception as exc:
         return f"Edit failed: {exc}"
+    return f"Edited {resolved}.{note}"
 
 
 # ---------------------------------------------------------------------------
@@ -3473,9 +3689,65 @@ class OllamaZedAgent(Agent):
                 return None  # deletions and shell scripts are always confirmed one at a time
             if base in {"mkdir", "touch", "cp", "mv", "chmod"}:
                 return f"cmd:{base}"
+            if base == "git":
+                # Remote, history-rewriting and discarding commands are confirmed every time.
+                return f"cmd:git {git_subcommand(argv[1:])}" if git_session_approvable(argv[1:]) else None
             sub_command = next((a for a in argv[1:] if not a.startswith("-")), None)
             return f"cmd:{base} {sub_command}" if sub_command else f"cmd:{base}"
         return None
+
+    def _file_diff(
+        self, session_id: str, name: str, args: dict[str, Any]
+    ) -> list[Any] | None:
+        """Before/after content for a pending write_file or edit_file, or None if it can't be previewed.
+
+        Zed renders this as a diff with the removed and added lines highlighted.
+        """
+        cwd = self.session_cwds.get(session_id, os.getcwd())
+        try:
+            if name == "edit_file":
+                _, planned = _prepare_edit(
+                    str(args.get("path", "")), str(args.get("old", "")), str(args.get("new", "")), cwd
+                )
+                if planned is None:
+                    return None
+                resolved, old_text, new_text, _ = planned
+            else:
+                if args.get("append"):
+                    return None
+                target = Path(str(args.get("path", ""))).expanduser()
+                if not target.is_absolute():
+                    target = Path(cwd) / target
+                resolved, old_text, new_text = Path(os.path.abspath(target)), None, str(args.get("content", ""))
+            return [FileEditToolCallContent(
+                type="diff", path=str(resolved), old_text=old_text, new_text=new_text
+            )]
+        except Exception:
+            log.exception("Could not build diff preview")
+            return None
+
+    async def _show_file_change(
+        self, session_id: str, name: str, args: dict[str, Any], before: list[Any] | None, observation: str
+    ) -> None:
+        """Leave a diff of an applied change in the Zed thread (what was removed, what replaced it)."""
+        if not before or is_failed_result(observation) or observation.startswith(("Not a file", "Write failed", "Edit failed")):
+            return
+        diff = before[0]
+        try:
+            await self.connection.session_update(
+                session_id=session_id,
+                update=ToolCallStart(
+                    sessionUpdate="tool_call",
+                    toolCallId=f"change-{uuid.uuid4().hex}",
+                    title=f"{'Edited' if name == 'edit_file' else 'Created'} {Path(diff.path).name}",
+                    kind="edit",
+                    status="completed",
+                    content=before,
+                    locations=[ToolCallLocation(path=diff.path)],
+                ),
+            )
+        except Exception:
+            log.exception("Could not show applied change")
 
     async def _approve_tool_action(
         self, session_id: str, name: str, args: dict[str, Any]
@@ -3502,6 +3774,7 @@ class OllamaZedAgent(Agent):
                 return text
             return text[:limit] + "\n... [preview truncated]"
 
+        diff_content: list[Any] | None = None
         if name == "write_file":
             kind = "edit"
             target = str(args.get("path", "(missing path)"))
@@ -3511,6 +3784,7 @@ class OllamaZedAgent(Agent):
                 f"File: {target}\nMode: {mode}\n\n"
                 f"Content preview:\n```text\n{clip(str(args.get('content', '')), 4000)}\n```"
             )
+            diff_content = self._file_diff(session_id, name, args)
         elif name == "edit_file":
             kind = "edit"
             target = str(args.get("path", "(missing path)"))
@@ -3520,6 +3794,7 @@ class OllamaZedAgent(Agent):
                 f"Replace:\n```text\n{clip(str(args.get('old', '')), 2000)}\n```\n"
                 f"With:\n```text\n{clip(str(args.get('new', '')), 2000)}\n```"
             )
+            diff_content = self._file_diff(session_id, name, args)
         elif name == "setup_test_env":
             kind = "execute"
             title = f"Set up test environment in: {args.get('directory') or '.'}"
@@ -3551,6 +3826,11 @@ class OllamaZedAgent(Agent):
             title = f"Run command: {command[:180]}"
             preview = f"Command to run:\n```sh\n{clip(command, 4000)}\n```"
             shell_argv, _ = validate_command(command)
+            if shell_argv and Path(shell_argv[0]).name == "git" and git_is_remote(shell_argv[1:]):
+                preview += (
+                    "\n\nThis contacts a remote. It runs OUTSIDE the sandbox, with network access "
+                    "and your git credentials."
+                )
             if shell_argv and Path(shell_argv[0]).name in SHELL_COMMANDS:
                 script, _ = check_shell_script(
                     shell_argv, Path(self.session_cwds.get(session_id, os.getcwd())).resolve()
@@ -3602,7 +3882,7 @@ class OllamaZedAgent(Agent):
                     status="pending",
                     title=title,
                     rawInput=args,
-                    content=[
+                    content=diff_content or [
                         ContentToolCallContent(
                             type="content",
                             content=TextContentBlock(type="text", text=preview),
@@ -3750,6 +4030,7 @@ class OllamaZedAgent(Agent):
                 "in the conversation history; re-read them with read_file if needed.]"
             )
         history.append({"role": "user", "content": history_text})
+        log_event("user", session=session_id, text=user_text, attachments=len(attachments))
 
         # Bound history to prevent indefinite context growth.
         history[:] = history[-MAX_HISTORY_MESSAGES:]
@@ -3882,6 +4163,12 @@ class OllamaZedAgent(Agent):
                 message = response.get("message") or {}
                 content = (message.get("content") or "").strip()
                 tool_calls = message.get("tool_calls") or []
+                log_event(
+                    "model", step=step, content=content, tool_calls=tool_calls,
+                    thinking=message.get("thinking"),
+                    prompt_tokens=response.get("prompt_eval_count"),
+                    reply_tokens=response.get("eval_count"),
+                )
 
                 if not tool_calls:
                     final_text = content or (
@@ -3936,8 +4223,11 @@ class OllamaZedAgent(Agent):
                         })
                         continue
 
+                    raw_args = args
                     args, arg_notes = normalize_tool_arguments(name, args)
                     validation_error = validate_tool_arguments(name, args)
+                    if arg_notes or validation_error:
+                        log_event("tool_args", tool=name, raw=raw_args, notes=arg_notes, invalid=validation_error)
                     if validation_error:
                         messages.append({
                             "role": "tool",
@@ -4003,6 +4293,7 @@ class OllamaZedAgent(Agent):
                             session_id, name, args
                         )
                         if not approved:
+                            log_event("tool_rejected", tool=name, args=args)
                             observation = (
                                 "Action rejected or approval unavailable. "
                                 "The action was NOT executed. Stop this turn's "
@@ -4023,9 +4314,15 @@ class OllamaZedAgent(Agent):
                             rejected_action = True
                             break
 
+                    file_change = (
+                        self._file_diff(session_id, name, args)
+                        if name in {"write_file", "edit_file"} else None
+                    )
                     observation = await asyncio.to_thread(
                         call_tool, name, args, cwd, cancel
                     )
+                    log_event("tool", tool=name, args=args, result=observation)
+                    await self._show_file_change(session_id, name, args, file_change, observation)
                     if arg_notes:
                         observation = "Note: " + "; ".join(arg_notes) + ".\n" + observation
                     if name == "run_tests":
@@ -4109,6 +4406,7 @@ class OllamaZedAgent(Agent):
                     "content": "(The user cancelled this turn.)" + record,
                 })
                 history[:] = history[-MAX_HISTORY_MESSAGES:]
+                log_event("cancelled", changes=actions)
                 return PromptResponse(stop_reason="cancelled")
 
             history.append({
@@ -4116,6 +4414,7 @@ class OllamaZedAgent(Agent):
                 "content": final_text + record,
             })
             history[:] = history[-MAX_HISTORY_MESSAGES:]
+            log_event("final", text=final_text, changes=actions)
 
             if not streamed_final_response:
                 await self.send_text(session_id, final_text)
@@ -4123,6 +4422,7 @@ class OllamaZedAgent(Agent):
 
         except Exception as exc:
             log.exception("Request failed")
+            log_event("error", type=type(exc).__name__, message=str(exc))
 
             hint = ""
             if "think" in str(exc).lower():
@@ -4175,6 +4475,8 @@ class OllamaZedAgent(Agent):
 
 async def main() -> None:
     ensure_state()
+    reset_session_log()
+    log_event("start", model=MODEL, keep_alive=KEEP_ALIVE)
 
     log.info(
         "Starting Zed ACP agent: model=%s, Ollama=%s",
