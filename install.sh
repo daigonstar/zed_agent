@@ -9,7 +9,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="${ZED_AGENT_VENV:-$HOME/.venvs/zed-agent}"
-MODEL="${OLLAMA_AGENT_MODEL:-qwen3:14b}"
+MODEL="${OLLAMA_AGENT_MODEL:-qwen3.6-coding-agent}"
+VISION_MODEL="${OLLAMA_AGENT_VISION_MODEL:-qwen2.5vl:7b}"
+# qwen3.6-coding-agent is built locally from this tag (see "Model" below).
+AGENT_BASE_MODEL="qwen3.6:35b-a3b-coding"
 ZED_SETTINGS="${ZED_SETTINGS:-$HOME/.config/zed/settings.json}"
 AGENT_NAME="Hypr Agent"
 
@@ -63,18 +66,62 @@ fi
 run "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check -r "$SCRIPT_DIR/requirements.txt"
 
 # --- Model -------------------------------------------------------------------
+installed() { ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qxE "$1(:latest)?"; }
+
+pull() {
+  if installed "$1"; then
+    echo "$1 is already installed."
+  else
+    run ollama pull "$1" || { warn "Could not pull $1; run 'ollama pull $1' later."; return 1; }
+  fi
+}
+
+# Build qwen3.6-coding-agent from the stock coding tag: drop the vision projector (it costs
+# VRAM that would otherwise hold experts) and turn MTP drafting off (with experts offloaded
+# to system RAM it stalls generation to ~1 token/s on a 16 GB card). Images are described
+# by $VISION_MODEL instead.
+build_agent_model() {
+  local modelfile
+  pull "$AGENT_BASE_MODEL" || return 1
+  if $DRY_RUN; then
+    echo "[dry-run] ollama create qwen3.6-coding-agent (from $AGENT_BASE_MODEL, text only, no MTP)"
+    return 0
+  fi
+  modelfile="$(mktemp)"
+  ollama show "$AGENT_BASE_MODEL" --modelfile | awk '
+    /^FROM / { if (seen++) next }                # keep the weights, drop the vision projector
+    /^PARAMETER (draft_num_predict|num_ctx|num_batch) / { next }
+    { print }
+    END {
+      print "PARAMETER draft_num_predict 0"
+      print "PARAMETER num_ctx 65536"
+      print "PARAMETER num_batch 1024"
+    }' > "$modelfile"
+  ollama create qwen3.6-coding-agent -f "$modelfile" || warn "Could not create qwen3.6-coding-agent."
+  rm -f "$modelfile"
+}
+
 if $PULL_MODEL; then
   step "Model ($MODEL)"
-  if command -v ollama >/dev/null; then
-    if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$MODEL"; then
-      echo "$MODEL is already installed."
-    elif curl -fsS --max-time 3 "${OLLAMA_HOST:-http://127.0.0.1:11434}/api/tags" >/dev/null 2>&1 || $DRY_RUN; then
-      run ollama pull "$MODEL" || warn "Could not pull $MODEL; run 'ollama pull $MODEL' later."
-    else
-      warn "Ollama is not running (try: sudo systemctl enable --now ollama). Then run: ollama pull $MODEL"
-    fi
-  else
+  if ! command -v ollama >/dev/null; then
     warn "ollama is not installed; skipping the model download."
+  elif ! curl -fsS --max-time 3 "${OLLAMA_HOST:-http://127.0.0.1:11434}/api/tags" >/dev/null 2>&1 && ! $DRY_RUN; then
+    warn "Ollama is not running (try: sudo systemctl enable --now ollama). Then re-run this script."
+  else
+    if [[ "$MODEL" == qwen3.6-coding-agent ]]; then
+      if installed "$MODEL"; then echo "$MODEL is already installed."; else build_agent_model; fi
+      # Without a bigger VRAM margin Ollama nearly fills a 16 GB card with this model and the
+      # driver starts evicting GPU memory to RAM (see README "Model").
+      if command -v systemctl >/dev/null && ! systemctl show ollama -p Environment 2>/dev/null | grep -q LLAMA_ARG_FIT_TARGET; then
+        warn "The ollama service has no LLAMA_ARG_FIT_TARGET. Add Environment=\"LLAMA_ARG_FIT_TARGET=3072\" to /etc/systemd/system/ollama.service.d/override.conf, then: sudo systemctl daemon-reload && sudo systemctl restart ollama"
+      fi
+    else
+      pull "$MODEL" || true
+    fi
+    if [[ -n "$VISION_MODEL" && "$VISION_MODEL" != off ]]; then
+      step "Vision model for screenshots ($VISION_MODEL)"
+      pull "$VISION_MODEL" || true
+    fi
   fi
 fi
 

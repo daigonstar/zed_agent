@@ -6,13 +6,18 @@ Dependencies:
 
 Optional environment variables:
     OLLAMA_HOST=http://127.0.0.1:11434
-    OLLAMA_AGENT_MODEL=devstral-small-2:latest   (overrides DEFAULT_MODEL below)
+    OLLAMA_AGENT_MODEL=qwen3.6-coding-agent   (overrides DEFAULT_MODEL below; install.sh builds it)
+    OLLAMA_AGENT_VISION_MODEL=qwen2.5vl:7b  (describes screenshots/images when the main model has no
+                                        vision; "off" disables)
+    OLLAMA_AGENT_VISION_GPU=0          (1 runs the vision model on the GPU, which unloads a large
+                                        main model; 0 keeps it on the CPU)
     OLLAMA_AGENT_THINK=high            (only sent to models that support thinking; low/medium/high
                                         for gpt-oss, true/false for other thinking models, and
                                         converted automatically; auto = never send the option)
     OLLAMA_AGENT_KEEP_ALIVE=5m         (how long the model stays loaded after the last request)
     OLLAMA_AGENT_HTTP_TIMEOUT=300
-    OLLAMA_AGENT_NUM_CTX=32768
+    OLLAMA_AGENT_NUM_CTX=65536
+    OLLAMA_AGENT_NUM_BATCH=1024        (prompt batch size; 0 leaves Ollama's default)
     OLLAMA_AGENT_MAX_TOOL_STEPS=40
     OLLAMA_AGENT_STATE_DIR=~/.local/share/zed-ollama-agent
     OLLAMA_AGENT_SESSION_LOG=/path     (conversation log, emptied on every start; default
@@ -43,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import fnmatch
 import json
 import logging
 import os
@@ -109,13 +115,25 @@ OLLAMA_URL = os.environ.get(
 ).rstrip("/")
 
 
-NUM_CTX = int(os.environ.get("OLLAMA_AGENT_NUM_CTX", "32768"))
+# Qwen3.6 uses hybrid attention, so 64K costs little VRAM over 32K (measured on a 16 GB card).
+NUM_CTX = int(os.environ.get("OLLAMA_AGENT_NUM_CTX", "65536"))
+# Larger prompt batches read long prompts faster; 1024 measured best (2048 was slower).
+NUM_BATCH = int(os.environ.get("OLLAMA_AGENT_NUM_BATCH", "1024"))
 MAX_TOOL_STEPS = int(os.environ.get("OLLAMA_AGENT_MAX_TOOL_STEPS", "40"))
 
 # ---- To switch model, change DEFAULT_MODEL here (or set OLLAMA_AGENT_MODEL) ----
-# Common models for AMD GPU users: qwen2.5:7b, llama3.1:8b, mistral:latest, etc.
-DEFAULT_MODEL = "qwen2.5:7b"
+# qwen3.6-coding-agent is qwen3.6:35b-a3b-coding without the vision projector and with
+# MTP drafting off (install.sh creates it). On a 16 GB card the stock tag overfills VRAM
+# and its MTP draft step stalls generation to ~1 token/s; this variant runs ~50 tokens/s.
+DEFAULT_MODEL = "qwen3.6-coding-agent"
 MODEL = os.environ.get("OLLAMA_AGENT_MODEL", "").strip() or DEFAULT_MODEL
+
+# Images are described by this model when MODEL cannot see them. It runs on the CPU by
+# default so the main model stays loaded on the GPU with its prompt cache.
+VISION_MODEL = os.environ.get("OLLAMA_AGENT_VISION_MODEL", "qwen2.5vl:7b").strip()
+if VISION_MODEL.lower() in {"", "0", "off", "none", "false"}:
+    VISION_MODEL = ""
+VISION_ON_GPU = os.environ.get("OLLAMA_AGENT_VISION_GPU", "0").lower() in {"1", "true", "yes"}
 
 
 def _parse_think(value: str):
@@ -314,7 +332,15 @@ Tool-call rules:
 - Commands are killed after a timeout, so never start servers or watchers such as artisan serve or npm run dev.
 - If the workspace already holds files, scaffold new projects into a subfolder rather than the workspace root.
 
+Navigating large workspaces:
+- Locate before reading: search_files for a symbol or text (narrow with path, glob such as '*.php', or regex=true), list_files with pattern to find files by name ('*Controller.php'). Do not walk folders one list_files call at a time.
+- vendor, node_modules, storage, build output and .gitignore entries are skipped by default; pass a path inside them only when you need framework or package source.
+- Read only what you need: use line_start/line_end around search hits in long files, and re-read a file before editing it if it may have changed.
+- Before changing something, search for every place that uses it (callers, views, configs, tests) and update them all; finish by searching again to confirm nothing was missed.
+- Configs are often split across files (Hyprland `source =` lines, Laravel config/*.php, .env). Follow the includes and edit the file where the setting already lives instead of adding a duplicate elsewhere. Match the existing style (variables such as $mainMod, indentation, naming).
+
 Laravel workflow (when the project has an artisan file):
+- Check the Laravel version in composer.json before writing framework code. Laravel 11+ has no app/Http/Kernel.php or RouteServiceProvider: middleware, routing and exceptions are configured in bootstrap/app.php. Reuse existing route groups, layouts and naming conventions.
 - Autonomous loop: (1) if vendor/ is missing or the result reports a missing dependency or autoload error, call setup_test_env (kind php; it runs composer install without scripts and creates .env with an app key); (2) run_tests with no command to get a baseline; (3) for each failure read the test, the code under test, and the error; (4) if the error is unclear, read storage/logs/laravel.log with read_file (tail it with line_start) and inspect the app with run_tests commands such as `php artisan route:list`, `php artisan migrate:status`, `php artisan config:show database` or `php artisan about`; (5) state the root cause, fix it with the smallest edit_file; (6) re-run the failing test (`php artisan test --filter=TestName`), then the full suite; (7) when green, run `php vendor/bin/pint --test` and phpstan if the project has them and fix what they report. Stop when the suite passes or you are blocked.
 - Common causes: missing APP_KEY or .env values, migrations not matching the model or factory, missing factory/seeder, wrong route name or middleware, mass-assignment ($fillable) errors, N+1 or relationship names, config cached from an old value, type errors after a PHP upgrade.
 - Fix the application code, not the test, unless the test itself is wrong; say why when you change a test. Add a migration or factory when schema or test data is missing rather than editing the database.
@@ -322,7 +348,7 @@ Laravel workflow (when the project has an artisan file):
 - Report at the end: what failed, the root cause, each change made, and the final test result.
 
 Running-app verification (Laravel/Vite and other web projects):
-- After the tests pass, verify the real app. (1) dev_server start the backend (`php artisan serve --port 8000`) and, if package.json has a dev script, the frontend (`npm run dev`); use the URL each one returns. If node_modules is missing, call setup_test_env kind node first. (2) check_app each important page (home, login, and routes found with `php artisan route:list`). It reports HTTP status, error pages, browser console errors and attaches a screenshot you can see: describe what is on it and say if the layout looks broken (unstyled, blank, missing assets). (3) On a problem, read dev_server logs and storage/logs/laravel.log, find the cause, fix it with edit_file, and check the page again. Common causes: Vite not running or manifest missing (`public/build` absent and no `public/hot`), APP_KEY missing, database not migrated (ask the user to run `php artisan migrate`), wrong APP_URL, a missing view or route, JavaScript import errors.
+- After the tests pass, verify the real app. (1) dev_server start the backend (`php artisan serve --port 8000`) and, if package.json has a dev script, the frontend (`npm run dev`); use the URL each one returns. If node_modules is missing, call setup_test_env kind node first. (2) check_app each important page (home, login, and routes found with `php artisan route:list`). It reports HTTP status, error pages, browser console errors and a screenshot (attached, or described in text when your model has no vision): say what is on the page and whether the layout looks broken (unstyled, blank, missing assets). (3) On a problem, read dev_server logs and storage/logs/laravel.log, find the cause, fix it with edit_file, and check the page again. Common causes: Vite not running or manifest missing (`public/build` absent and no `public/hot`), APP_KEY missing, database not migrated (ask the user to run `php artisan migrate`), wrong APP_URL, a missing view or route, JavaScript import errors.
 - Stop the servers with dev_server stop when you are done unless the user wants them left running. Never claim a page works unless check_app reported no problems for it.
 - If check_app says no browser was found, say that only the HTTP check was done. With Zen or Firefox only a screenshot is taken (no console errors), so also read the dev_server logs for Vite and JavaScript errors.
 
@@ -369,19 +395,26 @@ STR = lambda description: {
 TOOLS = [
     schema(
         "list_files",
-        "List files and folders in the current Zed workspace. Use this to explore project structure.",
+        "List files and folders in the current Zed workspace. Use this to explore project structure. "
+        "With pattern, find files by name recursively (dependency and build folders such as "
+        "vendor, node_modules and storage are skipped unless path points into them).",
         {
             "path": STR("Directory to list, relative to the workspace or an allowed absolute path."),
+            "pattern": STR("Optional file name glob to find recursively, e.g. '*Controller.php', "
+                           "'*.blade.php' or 'keybinds*'."),
         },
     ),
     schema(
         "search_files",
-        "Search literal text inside files recursively in the current Zed workspace. "
-        "Use query for a symbol, phrase, or error message; optionally narrow with path. "
-        "The search is read-only and does not use shell or regular expressions.",
+        "Search text inside files recursively in the current Zed workspace (case-insensitive). "
+        "Use query for a symbol, phrase, or error message; optionally narrow with path or glob. "
+        "Dependency and build folders (vendor, node_modules, storage, public/build and "
+        ".gitignore entries) are skipped unless path points into them.",
         {
-            "query": STR("Literal text to find in file contents."),
+            "query": STR("Text to find in file contents (literal unless regex is true)."),
             "path": STR("Optional workspace-relative directory to search; defaults to the workspace root."),
+            "glob": STR("Optional file name filter, e.g. '*.php' or '*.blade.php'."),
+            "regex": {"type": "boolean", "description": "Treat query as a Python regular expression."},
         },
         ["query"],
     ),
@@ -563,6 +596,7 @@ def ollama_stream_request(
     content_parts = []
     calls = {}
     thought_chars = 0
+    stats: dict[str, Any] = {}
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             for raw_line in response:
@@ -572,6 +606,14 @@ def ollama_stream_request(
                 if not raw_line.strip():
                     continue
                 item = json.loads(raw_line.decode("utf-8"))
+                if item.get("done"):
+                    # The last chunk carries token counts and timings (nanoseconds).
+                    stats = {
+                        key: item[key] for key in (
+                            "prompt_eval_count", "prompt_eval_duration",
+                            "eval_count", "eval_duration", "load_duration",
+                        ) if key in item
+                    }
                 message = item.get("message") or {}
                 thought = message.get("thinking") or ""
                 if thought:
@@ -629,7 +671,7 @@ def ollama_stream_request(
                 call["function"]["arguments"] = args
                 merged.append(call)
             message["tool_calls"] = merged
-        events.put(("done", {"message": message}))
+        events.put(("done", {"message": message, **stats}))
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode("utf-8", errors="replace")
         events.put(("error", RuntimeError(f"Ollama HTTP {exc.code}: {detail}")))
@@ -728,11 +770,47 @@ def model_supports_vision() -> bool | None:
 def model_options() -> dict:
     """Sampling options for MODEL. Qwen3 needs its recommended settings to avoid loops."""
     options: dict[str, Any] = {"num_ctx": NUM_CTX}
+    if NUM_BATCH:
+        options["num_batch"] = NUM_BATCH
     if NUM_PREDICT:
         options["num_predict"] = NUM_PREDICT
     if "qwen3" in MODEL.lower():
         options.update(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, repeat_penalty=1.05)
     return options
+
+
+_VISION_PROMPT = (
+    "You are the eyes of a coding agent that cannot see images. Describe this {what} "
+    "precisely: all visible text (verbatim when short), layout and structure, styling, and "
+    "any error messages. Say plainly if anything looks broken: unstyled HTML, blank areas, "
+    "overlapping or cut-off elements, missing images or icons. Only describe what is visible."
+)
+
+
+def describe_images(images: list[str], what: str = "image") -> str | None:
+    """Describe images with VISION_MODEL. Returns None when unavailable or on failure."""
+    if not VISION_MODEL or not images:
+        return None
+    options: dict[str, Any] = {"num_ctx": 8192, "num_predict": 400, "temperature": 0.2}
+    if not VISION_ON_GPU:
+        options["num_gpu"] = 0
+    try:
+        response = ollama_request("/api/chat", {
+            "model": VISION_MODEL,
+            "stream": False,
+            "keep_alive": "2m",
+            "messages": [{
+                "role": "user",
+                "content": _VISION_PROMPT.format(what=what),
+                "images": images,
+            }],
+            "options": options,
+        })
+    except Exception as exc:
+        log.warning("Vision model %s failed: %s", VISION_MODEL, exc)
+        return None
+    text = ((response.get("message") or {}).get("content") or "").strip()
+    return text or None
 
 
 _FAILURE_PREFIXES = (
@@ -2693,7 +2771,55 @@ def run_tests(
 # ---------------------------------------------------------------------------
 # File writing
 # ---------------------------------------------------------------------------
-def list_files(path: str = ".", cwd: str | None = None) -> str:
+# Folders that hold dependencies, caches or build output. Searching them buries project code
+# (a Laravel vendor/ folder alone has tens of thousands of files), so walks skip them unless
+# the requested path is already inside one.
+SKIP_DIR_NAMES = {
+    ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules", "vendor",
+    "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".idea",
+    ".vscode", ".next", ".nuxt", ".cache", "coverage", ".phpunit.cache", "target",
+}
+SKIP_REL_PATHS = {"storage", "bootstrap/cache", "public/build", "public/hot", "public/storage"}
+
+
+def _gitignored_dirs(workspace: Path) -> set[str]:
+    """Plain directory entries from the workspace's top-level .gitignore (no wildcards)."""
+    try:
+        lines = (workspace / ".gitignore").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return set()
+    entries = set()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith(("#", "!")) or any(ch in line for ch in "*?["):
+            continue
+        rel = line.strip("/")
+        if rel and (workspace / rel).is_dir():
+            entries.add(rel)
+    return entries
+
+
+def walk_project(target: Path, workspace: Path):
+    """os.walk over target in sorted order, skipping dependency/build folders and symlinks."""
+    skip_rel = SKIP_REL_PATHS | _gitignored_dirs(workspace)
+    for root, dirs, files in os.walk(target, followlinks=False):
+        root_path = Path(root)
+        kept = []
+        for d in sorted(dirs):
+            child = root_path / d
+            try:
+                rel = child.relative_to(workspace).as_posix()
+            except ValueError:
+                rel = ""
+            if (d in SKIP_DIR_NAMES or rel in skip_rel or child.is_symlink()
+                    or is_blocked_path(str(child))):
+                continue
+            kept.append(d)
+        dirs[:] = kept
+        yield root_path, dirs, sorted(files)
+
+
+def list_files(path: str = ".", cwd: str | None = None, pattern: str = "") -> str:
     """List files and folders within the workspace or home directory."""
     try:
         workspace = Path(cwd or os.getcwd()).resolve()
@@ -2712,6 +2838,21 @@ def list_files(path: str = ".", cwd: str | None = None) -> str:
         if not target.is_dir():
             return f"Not a directory: {target}"
 
+        if pattern:
+            matches = []
+            for root_path, _dirs, files in walk_project(target, workspace):
+                for filename in files:
+                    candidate = root_path / filename
+                    try:
+                        rel = candidate.relative_to(workspace).as_posix()
+                    except ValueError:
+                        rel = str(candidate)
+                    if fnmatch.fnmatch(filename.lower(), pattern.lower()) or fnmatch.fnmatch(rel.lower(), pattern.lower()):
+                        matches.append(rel)
+                        if len(matches) >= 200:
+                            return f"Files matching {pattern!r} (first 200):\n" + "\n".join(matches)
+            return f"Files matching {pattern!r}:\n" + ("\n".join(matches) or "(none)")
+
         entries = sorted(
             target.iterdir(),
             key=lambda p: (not p.is_dir(), p.name.lower()),
@@ -2725,7 +2866,9 @@ def list_files(path: str = ".", cwd: str | None = None) -> str:
         return f"Could not list files: {exc}"
 
 
-def search_files(query: str, path: str = ".", cwd: str | None = None) -> str:
+def search_files(
+    query: str, path: str = ".", cwd: str | None = None, glob: str = "", regex: bool = False,
+) -> str:
     """Search readable text files in the current workspace with bounded results."""
     try:
         if not query.strip():
@@ -2745,12 +2888,8 @@ def search_files(query: str, path: str = ".", cwd: str | None = None) -> str:
         if not target.is_dir():
             return f"Not a directory: {target}"
 
-        ignored = {
-            ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
-            "node_modules", "dist", "build", ".mypy_cache",
-            ".pytest_cache", ".ruff_cache", ".tox",
-        }
         needle = query.casefold()
+        pattern = re.compile(query, re.IGNORECASE) if regex else None
         results = []
         checked = 0
         bytes_read = 0
@@ -2758,15 +2897,10 @@ def search_files(query: str, path: str = ".", cwd: str | None = None) -> str:
         max_bytes = 30_000_000
         max_results = 50
 
-        for root, dirs, files in os.walk(target, followlinks=False):
-            root_path = Path(root)
-            dirs[:] = [
-                d for d in dirs
-                if d not in ignored
-                and not (root_path / d).is_symlink()
-                and not is_blocked_path(str(root_path / d))
-            ]
+        for root_path, _dirs, files in walk_project(target, workspace):
             for filename in files:
+                if glob and not fnmatch.fnmatch(filename.lower(), glob.lower()):
+                    continue
                 candidate = root_path / filename
                 if (candidate.is_symlink() or not candidate.is_file() or ".bak" in candidate.name or ".before_" in candidate.name or ".broken_" in candidate.name):
                     continue
@@ -2791,7 +2925,7 @@ def search_files(query: str, path: str = ".", cwd: str | None = None) -> str:
                 checked += 1
                 bytes_read += size
                 for number, line in enumerate(content.splitlines(), 1):
-                    if needle in line.casefold():
+                    if (pattern.search(line) if pattern else needle in line.casefold()):
                         results.append(
                             f"{candidate.relative_to(workspace)}:{number}: {line.strip()[:180]}"
                         )
@@ -3563,7 +3697,18 @@ def _queue_screenshot(shot: Path, report: list[str]) -> None:
                 _TOOL_IMAGES.append(base64.b64encode(shot.read_bytes()).decode("ascii"))
             report.append("A screenshot of the page is attached in the next message.")
         elif model_supports_vision() is False:
-            report.append(f"Model {MODEL} has no vision support, so the screenshot was not sent.")
+            description = None
+            if shot.stat().st_size <= 5_000_000:
+                description = describe_images(
+                    [base64.b64encode(shot.read_bytes()).decode("ascii")], "web page screenshot"
+                )
+            if description:
+                report.append(
+                    f"Screenshot description (from {VISION_MODEL}; you cannot see the image "
+                    f"itself):\n{description}"
+                )
+            else:
+                report.append(f"Model {MODEL} has no vision support, so the screenshot was not sent.")
     except OSError:
         pass
 
@@ -3941,6 +4086,7 @@ def call_tool(
             return list_files(
                 str(args.get("path", ".")),
                 cwd=cwd,
+                pattern=str(args.get("pattern") or ""),
             )
 
         if name == "search_files":
@@ -3948,6 +4094,8 @@ def call_tool(
                 str(args.get("query", "")),
                 str(args.get("path", ".")),
                 cwd=cwd,
+                glob=str(args.get("glob") or ""),
+                regex=bool(args.get("regex")),
             )
 
         if name == "read_file":
@@ -4033,8 +4181,8 @@ def call_tool(
 
 
 TOOL_ARG_KEYS = {
-    "list_files": {"path"},
-    "search_files": {"query", "path"},
+    "list_files": {"path", "pattern"},
+    "search_files": {"query", "path", "glob", "regex"},
     "read_file": {"path", "line_start", "line_end"},
     "run_command": {"command"},
     "run_tests": {"command", "directory", "timeout_seconds", "env", "failed_only"},
@@ -4062,7 +4210,7 @@ _ARG_ALIASES = {
     "end_line": "line_end", "environment": "env", "failed": "failed_only",
 }
 _INT_ARGS = {"line_start", "line_end", "timeout_seconds"}
-_BOOL_ARGS = {"append", "failed_only"}
+_BOOL_ARGS = {"append", "failed_only", "regex"}
 
 
 def normalize_tool_arguments(name: str, args: Any) -> tuple[Any, list[str]]:
@@ -4127,8 +4275,8 @@ def validate_tool_arguments(name: str, args: Any) -> str | None:
     }
     optional_strings = {
         "dev_server": ("name", "command"),
-        "list_files": ("path",),
-        "search_files": ("path",),
+        "list_files": ("path", "pattern"),
+        "search_files": ("path", "glob"),
         "run_tests": ("command", "directory"),
         "setup_test_env": ("directory", "kind", "packages"),
     }
@@ -4181,6 +4329,13 @@ def validate_tool_arguments(name: str, args: Any) -> str | None:
         return "action must be start, stop, logs or status."
     if name == "write_file" and "append" in args and not isinstance(args["append"], bool):
         return "The append argument must be a Boolean."
+    if name == "search_files" and "regex" in args and not isinstance(args["regex"], bool):
+        return "The regex argument must be a Boolean."
+    if name == "search_files" and args.get("regex"):
+        try:
+            re.compile(args.get("query", ""))
+        except re.error as exc:
+            return f"Invalid regular expression: {exc}"
     if name == "system_info" and args.get("category") not in categories:
         return "Invalid system_info category."
     return None
@@ -4797,11 +4952,24 @@ class OllamaZedAgent(Agent):
         attachments = self._read_attachments(session_id, prompt, user_text)
         images, image_notes = self._read_images(session_id, prompt)
         if images and await asyncio.to_thread(model_supports_vision) is False:
-            image_notes.append(
-                f"Model {MODEL} has no vision support, so the image was not sent. "
-                "Set OLLAMA_AGENT_MODEL to a vision model (e.g. qwen2.5vl, gemma3, llama3.2-vision)."
-            )
-            await self.send_text(session_id, image_notes[-1])
+            description = None
+            if VISION_MODEL:
+                await self.send_text(
+                    session_id, f"Describing the image with {VISION_MODEL}; this can take a minute.\n\n"
+                )
+                description = await asyncio.to_thread(describe_images, images, "image")
+            if description:
+                image_notes.append(
+                    f"The user attached {len(images)} image(s). Description from {VISION_MODEL} "
+                    f"(you cannot see the image itself): {description}"
+                )
+            else:
+                image_notes.append(
+                    f"Model {MODEL} has no vision support, so the image was not sent. "
+                    "Set OLLAMA_AGENT_VISION_MODEL to a vision model (e.g. qwen2.5vl:7b) "
+                    "to have images described."
+                )
+                await self.send_text(session_id, image_notes[-1])
             images = []
         if image_notes:
             attachments = "\n".join(f"[{n}]" for n in image_notes) + (
@@ -4978,6 +5146,8 @@ class OllamaZedAgent(Agent):
                     thinking=message.get("thinking"),
                     prompt_tokens=response.get("prompt_eval_count"),
                     reply_tokens=response.get("eval_count"),
+                    prompt_seconds=round((response.get("prompt_eval_duration") or 0) / 1e9, 2),
+                    reply_seconds=round((response.get("eval_duration") or 0) / 1e9, 2),
                 )
 
                 if not tool_calls:
@@ -5490,7 +5660,14 @@ def run_self_check() -> int:
     print(f"Model:            {MODEL}")
     print(f"Thinking option:  {think_option() or 'not sent'}")
     print(f"Ollama host:      {OLLAMA_URL}")
-    print(f"Context / steps:  {NUM_CTX} tokens, {MAX_TOOL_STEPS} tool steps")
+    print(f"Context / steps:  {NUM_CTX} tokens (batch {NUM_BATCH or 'default'}), {MAX_TOOL_STEPS} tool steps")
+    vision = model_supports_vision()
+    if vision is False:
+        where = "GPU" if VISION_ON_GPU else "CPU"
+        print(f"Vision:           described by {VISION_MODEL} on the {where}" if VISION_MODEL
+              else "Vision:           off (main model has no vision, OLLAMA_AGENT_VISION_MODEL=off)")
+    else:
+        print(f"Vision:           {'main model' if vision else 'unknown'}")
     print(f"Read-only mode:   {'on' if READ_ONLY_MODE else 'off'}")
     print(f"Ollama:           {check_ollama()}")
     print(f"Sandbox:          {sandbox_status()}")

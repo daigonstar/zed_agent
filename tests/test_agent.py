@@ -462,6 +462,44 @@ class RunTestsTests(unittest.TestCase):
             del os.environ["MY_API_KEY"]
 
 
+class NavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.ws = _workspace()
+        for rel, text in {
+            "app/Services/Tax.php": "function calculateInvoiceTax() {}\n",
+            "vendor/laravel/Helper.php": "calculateInvoiceTax in vendor\n",
+            "storage/logs/laravel.log": "calculateInvoiceTax in a log\n",
+            "generated/out.php": "calculateInvoiceTax generated\n",
+            "resources/views/home.blade.php": "<h1>calculateInvoiceTax</h1>\n",
+        }.items():
+            (self.ws / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.ws / rel).write_text(text)
+        (self.ws / ".gitignore").write_text("/generated\n*.log\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.ws, ignore_errors=True)
+
+    def test_search_skips_dependencies_unless_targeted(self):
+        out = h.search_files("calculateInvoiceTax", cwd=str(self.ws))
+        self.assertIn("app/Services/Tax.php", out)
+        for skipped in ("vendor/", "storage/", "generated/"):
+            self.assertNotIn(skipped, out)
+        self.assertIn("vendor/laravel/Helper.php", h.search_files("calculateInvoiceTax", "vendor", cwd=str(self.ws)))
+
+    def test_search_glob_and_regex(self):
+        out = h.search_files("calculateInvoiceTax", cwd=str(self.ws), glob="*.blade.php")
+        self.assertIn("home.blade.php", out)
+        self.assertNotIn("Tax.php", out)
+        out = h.search_files(r"function \w+Tax\(", cwd=str(self.ws), regex=True)
+        self.assertIn("app/Services/Tax.php:1", out)
+        self.assertIn("Invalid regular expression", h.validate_tool_arguments("search_files", {"query": "(", "regex": True}))
+
+    def test_list_files_pattern_finds_by_name(self):
+        out = h.list_files(".", cwd=str(self.ws), pattern="*.blade.php")
+        self.assertIn("resources/views/home.blade.php", out)
+        self.assertNotIn("Tax.php", out)
+
+
 class ContextTrimTests(unittest.TestCase):
     def test_history_is_cut_in_bulk_and_starts_on_user(self):
         history = [
