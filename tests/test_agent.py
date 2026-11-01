@@ -462,6 +462,34 @@ class RunTestsTests(unittest.TestCase):
             del os.environ["MY_API_KEY"]
 
 
+class ContextTrimTests(unittest.TestCase):
+    def test_history_is_cut_in_bulk_and_starts_on_user(self):
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+            for i in range(h.MAX_HISTORY_MESSAGES)
+        ]
+        h.trim_history(history)
+        self.assertEqual(len(history), h.MAX_HISTORY_MESSAGES)
+        history.append({"role": "user", "content": "new"})
+        h.trim_history(history)
+        self.assertLessEqual(len(history), h.HISTORY_KEEP_MESSAGES)
+        self.assertEqual(history[0]["role"], "user")
+        self.assertEqual(history[-1]["content"], "new")
+
+    def test_compaction_trims_below_target_and_counts_thinking(self):
+        big = "x" * h.CONTEXT_CHAR_BUDGET
+        messages = [{"role": "system", "content": "sys"}]
+        messages.append({"role": "assistant", "content": "", "thinking": big,
+                         "tool_calls": [{"function": {"name": "read_file", "arguments": {}}}]})
+        messages += [{"role": "tool", "content": "y" * 5000} for _ in range(4)]
+        messages += [{"role": "user", "content": "recent"} for _ in range(8)]
+        h.compact_messages(messages)
+        self.assertNotIn("thinking", messages[1])
+        size = sum(len(m.get("content") or "") + len(m.get("thinking") or "") for m in messages)
+        self.assertLessEqual(size, h.CONTEXT_CHAR_BUDGET * h.CONTEXT_TRIM_TARGET)
+        self.assertEqual(messages[-1]["content"], "recent")
+
+
 class SummaryTests(unittest.TestCase):
     def test_pytest_failures_are_extracted(self):
         digest, failing = h.summarise_test_output(

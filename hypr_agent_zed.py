@@ -10,7 +10,7 @@ Optional environment variables:
     OLLAMA_AGENT_THINK=high            (only sent to models that support thinking; low/medium/high
                                         for gpt-oss, true/false for other thinking models, and
                                         converted automatically; auto = never send the option)
-    OLLAMA_AGENT_KEEP_ALIVE=30s
+    OLLAMA_AGENT_KEEP_ALIVE=5m         (how long the model stays loaded after the last request)
     OLLAMA_AGENT_HTTP_TIMEOUT=300
     OLLAMA_AGENT_NUM_CTX=32768
     OLLAMA_AGENT_MAX_TOOL_STEPS=40
@@ -139,7 +139,9 @@ def _parse_think(value: str):
 # The option is only sent when the loaded model reports the "thinking" capability
 # (see think_option()). Use "auto" to never send it.
 THINK = _parse_think(os.environ.get("OLLAMA_AGENT_THINK", "high"))
-KEEP_ALIVE = os.environ.get("OLLAMA_AGENT_KEEP_ALIVE", "30s")
+# Long enough to cover approval prompts and pauses; a large model takes seconds to reload
+# and loses its prompt cache when it is unloaded.
+KEEP_ALIVE = os.environ.get("OLLAMA_AGENT_KEEP_ALIVE", "5m")
 
 # Optional: stop a step whose reasoning runs past this many characters and redo it
 # without thinking. Off by default so reasoning always stays visible; 0 disables.
@@ -158,6 +160,10 @@ MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 10_000_000
 MAX_WRITE_BYTES = 200_000
 MAX_HISTORY_MESSAGES = 40
+# When history is over the limit it is cut back to this many messages in one go, so the
+# prompt prefix (and Ollama's prompt cache) stays stable for many turns instead of
+# shifting by one message every turn.
+HISTORY_KEEP_MESSAGES = 24
 
 # Panic switch: refuse every file change and every non-read-only command.
 READ_ONLY_MODE = (
@@ -208,6 +214,9 @@ SESSION_APPROVALS = (
 
 # Rough budget for message text (characters) before old tool output is trimmed.
 CONTEXT_CHAR_BUDGET = int(NUM_CTX * 2.0)
+# Once over budget, trim down to this fraction of it. Trimming changes the prompt
+# prefix and makes Ollama re-read everything after it, so do it rarely and in bulk.
+CONTEXT_TRIM_TARGET = 0.6
 
 logging.basicConfig(
     level=os.environ.get("OLLAMA_AGENT_LOG_LEVEL", "WARNING").upper(),
@@ -4210,6 +4219,7 @@ def compact_messages(messages: list[dict[str, Any]]) -> None:
     def size() -> int:
         return sum(
             len(message.get("content") or "")
+            + len(message.get("thinking") or "")
             + len(json.dumps(message.get("tool_calls") or []))
             for message in messages
         )
@@ -4217,6 +4227,7 @@ def compact_messages(messages: list[dict[str, Any]]) -> None:
     if size() <= CONTEXT_CHAR_BUDGET:
         return
 
+    target = CONTEXT_CHAR_BUDGET * CONTEXT_TRIM_TARGET
     protected_from = len(messages) - 8
     for index, message in enumerate(messages):
         if index == 0 or index >= protected_from:
@@ -4231,10 +4242,24 @@ def compact_messages(messages: list[dict[str, Any]]) -> None:
                     + text[-300:]
                 ),
             }
-        elif message.get("role") == "assistant" and message.get("tool_calls"):
-            messages[index] = _shrink_tool_calls(message)
-        if size() <= CONTEXT_CHAR_BUDGET:
+        elif message.get("role") == "assistant" and (
+            message.get("tool_calls") or message.get("thinking")
+        ):
+            message = {key: value for key, value in message.items() if key != "thinking"}
+            messages[index] = _shrink_tool_calls(message) if message.get("tool_calls") else message
+        if size() <= target:
             return
+
+
+def trim_history(history: list[dict[str, Any]]) -> None:
+    """Cut history back to HISTORY_KEEP_MESSAGES once it exceeds MAX_HISTORY_MESSAGES."""
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return
+    kept = history[-HISTORY_KEEP_MESSAGES:]
+    # Start on a user message so the model never sees a reply without its question.
+    while kept and kept[0].get("role") != "user":
+        kept.pop(0)
+    history[:] = kept
 
 
 # ---------------------------------------------------------------------------
@@ -4813,7 +4838,7 @@ class OllamaZedAgent(Agent):
         )
 
         # Bound history to prevent indefinite context growth.
-        history[:] = history[-MAX_HISTORY_MESSAGES:]
+        trim_history(history)
 
         system = SYSTEM_PROMPT
 
@@ -5210,7 +5235,7 @@ class OllamaZedAgent(Agent):
                     "role": "assistant",
                     "content": "(The user cancelled this turn.)" + record,
                 })
-                history[:] = history[-MAX_HISTORY_MESSAGES:]
+                trim_history(history)
                 log_event("cancelled", changes=actions)
                 return PromptResponse(stop_reason="cancelled")
 
@@ -5218,7 +5243,7 @@ class OllamaZedAgent(Agent):
                 "role": "assistant",
                 "content": final_text + record,
             })
-            history[:] = history[-MAX_HISTORY_MESSAGES:]
+            trim_history(history)
             log_event("final", text=final_text, changes=actions)
 
             if not streamed_final_response:
