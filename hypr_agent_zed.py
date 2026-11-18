@@ -86,6 +86,7 @@ from acp.schema import (
     FileEditToolCallContent,
     PermissionOption,
     ToolCallLocation,
+    ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
     AgentCapabilities,
@@ -4418,6 +4419,87 @@ def trim_history(history: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tool-call reporting (what Zed shows in the thread and what "Follow agent" jumps to)
+# ---------------------------------------------------------------------------
+
+TOOL_KINDS = {
+    "read_file": "read", "list_files": "search", "search_files": "search",
+    "write_file": "edit", "edit_file": "edit",
+    "run_command": "execute", "run_tests": "execute", "setup_test_env": "execute",
+    "dev_server": "execute", "web_search": "fetch", "web_fetch": "fetch", "check_app": "fetch",
+}
+_SEARCH_HIT = re.compile(r"^(.+?):(\d+): ", re.M)
+
+
+def _workspace_path(path: str, cwd: str) -> Path:
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = Path(cwd) / target
+    return Path(os.path.abspath(target))
+
+
+def tool_call_title(name: str, args: dict[str, Any]) -> str:
+    """A short title for the tool call in Zed's thread."""
+    path = str(args.get("path") or "")
+    if name == "read_file":
+        start, end = args.get("line_start"), args.get("line_end")
+        span = f" (lines {start}-{end or 'end'})" if start else ""
+        return f"Read {path}{span}"
+    if name == "search_files":
+        where = f" in {path}" if path and path != "." else ""
+        return f"Search {str(args.get('query', ''))[:60]!r}{where}"
+    if name == "list_files":
+        pattern = args.get("pattern")
+        return f"Find {pattern!r} in {path or '.'}" if pattern else f"List {path or '.'}"
+    if name == "edit_file":
+        return f"Edit {path}"
+    if name == "write_file":
+        return f"{'Append to' if args.get('append') else 'Write'} {path}"
+    if name in {"run_command", "run_tests"}:
+        return str(args.get("command") or "Run the project tests")[:120]
+    if name in {"web_search", "web_fetch", "check_app"}:
+        return f"{name.replace('_', ' ').capitalize()}: {str(args.get('query') or args.get('url') or '')[:100]}"
+    return name.replace("_", " ").capitalize()
+
+
+def tool_call_locations(name: str, args: dict[str, Any], cwd: str) -> list[ToolCallLocation]:
+    """File and line a tool call is about to touch. Lines are 0-based, as Zed expects."""
+    path = str(args.get("path") or "")
+    if not path or name not in {"read_file", "edit_file", "write_file"}:
+        return []
+    target = _workspace_path(path, cwd)
+    line = 0
+    if name == "read_file" and isinstance(args.get("line_start"), int):
+        line = max(args["line_start"] - 1, 0)
+    elif name == "edit_file":
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+            index = text.find(str(args.get("old", "")))
+            if index >= 0:
+                line = text.count("\n", 0, index)
+        except OSError:
+            pass
+    elif name == "write_file" and args.get("append"):
+        try:
+            line = target.read_text(encoding="utf-8", errors="replace").count("\n")
+        except OSError:
+            pass
+    return [ToolCallLocation(path=str(target), line=line)]
+
+
+def search_hit_locations(observation: str, cwd: str, limit: int = 5) -> list[ToolCallLocation]:
+    """Locations of the first search_files hits (path:line: text)."""
+    hits = []
+    for match in _SEARCH_HIT.finditer(observation):
+        hits.append(ToolCallLocation(
+            path=str(_workspace_path(match.group(1), cwd)), line=max(int(match.group(2)) - 1, 0)
+        ))
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # ACP agent
 # ---------------------------------------------------------------------------
 
@@ -4588,28 +4670,55 @@ class OllamaZedAgent(Agent):
             log.exception("Could not build diff preview")
             return None
 
-    async def _show_file_change(
-        self, session_id: str, name: str, args: dict[str, Any], before: list[Any] | None, observation: str
-    ) -> None:
-        """Leave a diff of an applied change in the Zed thread (what was removed, what replaced it)."""
-        if not before or is_failed_result(observation) or observation.startswith(("Not a file", "Write failed", "Edit failed")):
-            return
-        diff = before[0]
+    async def _start_tool_call(
+        self, session_id: str, name: str, args: dict[str, Any], cwd: str
+    ) -> tuple[str, list[ToolCallLocation]]:
+        """Show the tool call in Zed as running, with the file and line it is about to touch.
+
+        Zed's "Follow agent" jumps to these locations, so they are sent before the tool runs.
+        """
+        call_id = f"call-{uuid.uuid4().hex}"
+        locations = tool_call_locations(name, args, cwd)
         try:
             await self.connection.session_update(
                 session_id=session_id,
                 update=ToolCallStart(
                     sessionUpdate="tool_call",
-                    toolCallId=f"change-{uuid.uuid4().hex}",
-                    title=f"{'Edited' if name == 'edit_file' else 'Created'} {Path(diff.path).name}",
-                    kind="edit",
-                    status="completed",
-                    content=before,
-                    locations=[ToolCallLocation(path=diff.path)],
+                    toolCallId=call_id,
+                    title=tool_call_title(name, args),
+                    kind=TOOL_KINDS.get(name, "other"),
+                    status="in_progress",
+                    locations=locations or None,
+                    rawInput=args,
                 ),
             )
         except Exception:
-            log.exception("Could not show applied change")
+            log.exception("Could not report tool call start")
+        return call_id, locations
+
+    async def _finish_tool_call(
+        self, session_id: str, call_id: str, name: str, cwd: str,
+        locations: list[ToolCallLocation], diff: list[Any] | None, observation: str,
+    ) -> None:
+        """Mark the tool call done; edits get their diff, searches point at their first hits."""
+        failed = is_failed_result(observation) or observation.startswith(
+            ("Not a file", "Write failed", "Edit failed", "Could not")
+        )
+        if name == "search_files":
+            locations = search_hit_locations(observation, cwd) or locations
+        try:
+            await self.connection.session_update(
+                session_id=session_id,
+                update=ToolCallProgress(
+                    sessionUpdate="tool_call_update",
+                    toolCallId=call_id,
+                    status="failed" if failed else "completed",
+                    locations=locations or None,
+                    content=diff if diff and not failed else None,
+                ),
+            )
+        except Exception:
+            log.exception("Could not report tool call result")
 
     async def _approve_tool_action(
         self, session_id: str, name: str, args: dict[str, Any]
@@ -5310,11 +5419,14 @@ class OllamaZedAgent(Agent):
                         self._file_diff(session_id, name, args)
                         if name in {"write_file", "edit_file"} else None
                     )
+                    call_id, locations = await self._start_tool_call(session_id, name, args, cwd)
                     observation = await asyncio.to_thread(
                         call_tool, name, args, cwd, cancel
                     )
                     log_event("tool", tool=name, args=args, result=observation)
-                    await self._show_file_change(session_id, name, args, file_change, observation)
+                    await self._finish_tool_call(
+                        session_id, call_id, name, cwd, locations, file_change, observation
+                    )
                     if arg_notes:
                         observation = "Note: " + "; ".join(arg_notes) + ".\n" + observation
                     if name == "run_tests":

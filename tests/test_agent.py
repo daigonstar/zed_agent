@@ -500,6 +500,30 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn("Tax.php", out)
 
 
+class FollowLocationTests(unittest.TestCase):
+    def setUp(self):
+        self.ws = _workspace()
+        (self.ws / "app").mkdir()
+        (self.ws / "app" / "User.php").write_text("<?php\nclass User\n{\n    public function getFullName() {}\n}\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.ws, ignore_errors=True)
+
+    def test_edit_points_at_the_changed_line(self):
+        locations = h.tool_call_locations(
+            "edit_file", {"path": "app/User.php", "old": "public function getFullName", "new": "x"}, str(self.ws)
+        )
+        self.assertEqual(locations[0].path, str(self.ws / "app" / "User.php"))
+        self.assertEqual(locations[0].line, 3)  # 0-based: line 4 in the editor
+
+    def test_read_uses_line_start_and_search_uses_hits(self):
+        locations = h.tool_call_locations("read_file", {"path": "app/User.php", "line_start": 4}, str(self.ws))
+        self.assertEqual(locations[0].line, 3)
+        self.assertEqual(h.tool_call_locations("run_tests", {}, str(self.ws)), [])
+        hits = h.search_hit_locations(h.search_files("getFullName", cwd=str(self.ws)), str(self.ws))
+        self.assertEqual((hits[0].path, hits[0].line), (str(self.ws / "app" / "User.php"), 3))
+
+
 class ContextTrimTests(unittest.TestCase):
     def test_history_is_cut_in_bulk_and_starts_on_user(self):
         history = [
