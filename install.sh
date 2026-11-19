@@ -112,8 +112,19 @@ if $PULL_MODEL; then
       if installed "$MODEL"; then echo "$MODEL is already installed."; else build_agent_model; fi
       # Without a bigger VRAM margin Ollama nearly fills a 16 GB card with this model and the
       # driver starts evicting GPU memory to RAM (see README "Model").
-      if command -v systemctl >/dev/null && ! systemctl show ollama -p Environment 2>/dev/null | grep -q LLAMA_ARG_FIT_TARGET; then
-        warn "The ollama service has no LLAMA_ARG_FIT_TARGET. Add Environment=\"LLAMA_ARG_FIT_TARGET=3072\" to /etc/systemd/system/ollama.service.d/override.conf, then: sudo systemctl daemon-reload && sudo systemctl restart ollama"
+      # Without LLAMA_ARG_CACHE_RAM llama-server keeps up to 8 GB of old prompts in RAM; on a long
+      # session that squeezes the CPU-side experts out of memory and generation stalls for minutes.
+      if command -v systemctl >/dev/null; then
+        svc_env="$(systemctl show ollama -p Environment 2>/dev/null)"
+        need=()
+        for kv in LLAMA_ARG_FIT_TARGET=3072 LLAMA_ARG_CACHE_RAM=1024 LLAMA_ARG_CTX_CHECKPOINTS=8; do
+          grep -q "${kv%%=*}=" <<<"$svc_env" || need+=("Environment=\"$kv\"")
+        done
+        if ((${#need[@]})); then
+          warn "Add these lines under [Service] in /etc/systemd/system/ollama.service.d/override.conf (see README \"Model\"):"
+          printf '    %s\n' "${need[@]}" >&2
+          warn "then: sudo systemctl daemon-reload && sudo systemctl restart ollama"
+        fi
       fi
     else
       pull "$MODEL" || true

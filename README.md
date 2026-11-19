@@ -19,6 +19,16 @@ Ollama service settings (`/etc/systemd/system/ollama.service.d/override.conf`):
     Environment="OLLAMA_FLASH_ATTENTION=1"
     Environment="LLAMA_ARG_FIT_TARGET=3072"
     Environment="OLLAMA_NUM_PARALLEL=1"
+    Environment="LLAMA_ARG_CACHE_RAM=1024"
+    Environment="LLAMA_ARG_CTX_CHECKPOINTS=8"
+
+`LLAMA_ARG_CACHE_RAM=1024` and `LLAMA_ARG_CTX_CHECKPOINTS=8` keep long sessions from
+failing. By default llama-server saves every prompt it moves away from (about 600 MB at
+27K tokens) in a RAM cache of up to 8 GB, plus up to 32 context checkpoints of about 60 MB
+each. Each history trim saves one. In testing the cache reached 7.7 GB and pushed the
+model's CPU-side experts out of memory. Generation then stalled for minutes, one cache save
+took 500 s, and Ollama returned a 500 error after 5 minutes. With a `MemoryMax` on the
+service this happens sooner. Old prompts are almost never reused here, so 1 GB is enough.
 
 `LLAMA_ARG_FIT_TARGET=3072` matters: Ollama's automatic placement underestimates this
 model's VRAM use by about 1.5 GB, so with the default margin the card ends up nearly full
